@@ -447,6 +447,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "oni"
+version = "1.0.0"
+dependencies = [
+ "anyhow",
+ "bincode",
+ "bytes",
+ "clap",
+ "env_logger",
+ "filetime",
+ "futures",
+ "log",
+ "serde",
+ "sha2",
+ "thiserror",
+ "tokio",
+ "tokio-util",
+ "walkdir",
+]
+
+[[package]]
 name = "parking_lot"
 version = "0.12.3"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -638,26 +658,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "unicode-ident",
-]
-
-[[package]]
-name = "syncrs"
-version = "1.0.0"
-dependencies = [
- "anyhow",
- "bincode",
- "bytes",
- "clap",
- "env_logger",
- "filetime",
- "futures",
- "log",
- "serde",
- "sha2",
- "thiserror",
- "tokio",
- "tokio-util",
- "walkdir",
 ]
 
 [[package]]

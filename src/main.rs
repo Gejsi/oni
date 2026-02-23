@@ -10,7 +10,7 @@ use clap::Parser;
 use path::FilePath;
 use protocol::{run_client, run_server};
 
-/// syncrs, a local and remote file-copying tool
+/// oni, a local and remote file-copying tool
 #[derive(Parser, Debug)]
 #[command(version, about)]
 struct Cli {
