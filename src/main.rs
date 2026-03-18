@@ -1,14 +1,9 @@
-pub mod block;
-pub mod delta;
-pub mod path;
-pub mod protocol;
-
 use std::net::{IpAddr, Ipv4Addr};
 
 use anyhow::Context;
 use clap::Parser;
-use path::FilePath;
-use protocol::{run_client, run_server};
+use oni::path::FilePath;
+use oni::protocol::{run_client, run_server};
 
 /// oni, a local and remote file-copying tool
 #[derive(Parser, Debug)]
