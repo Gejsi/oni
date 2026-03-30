@@ -5,49 +5,17 @@ use thiserror::Error;
 #[derive(Debug, Error)]
 pub enum OniError {
     #[error(transparent)]
-    Cli(#[from] CliError),
-    #[error(transparent)]
-    Session(#[from] SessionError),
+    Manifest(#[from] ManifestError),
 }
 
 #[derive(Debug, Error)]
-pub enum CliError {
-    #[error("unsupported invocation: {0}")]
-    UnsupportedInvocation(String),
-}
-
-#[derive(Debug, Error)]
-pub enum SessionError {
-    #[error(transparent)]
-    Transport(#[from] TransportError),
-    #[error(transparent)]
-    Plan(#[from] PlanError),
-    #[error(transparent)]
-    Apply(#[from] ApplyError),
-    #[error("session state violation: {0}")]
-    StateViolation(&'static str),
-}
-
-#[derive(Debug, Error)]
-pub enum TransportError {
-    #[error("transport is not implemented: {feature}")]
-    NotImplemented { feature: &'static str },
-    #[error("transport closed unexpectedly")]
-    Closed,
-}
-
-#[derive(Debug, Error)]
-pub enum PlanError {
-    #[error("planner is not implemented: {feature}")]
-    NotImplemented { feature: &'static str },
-    #[error("invalid relative path in plan: {path}")]
-    InvalidRelativePath { path: PathBuf },
-}
-
-#[derive(Debug, Error)]
-pub enum ApplyError {
-    #[error("applier is not implemented: {feature}")]
-    NotImplemented { feature: &'static str },
-    #[error("refusing to escape destination root: {path}")]
-    PathEscape { path: PathBuf },
+pub enum ManifestError {
+    #[error("path does not exist: {path}")]
+    MissingPath { path: PathBuf },
+    #[error("failed to walk filesystem under: {root}")]
+    Walk { root: PathBuf },
+    #[error("failed to read metadata for: {path}")]
+    Metadata { path: PathBuf },
+    #[error("failed to compute relative path for: {path}")]
+    RelativePath { path: PathBuf },
 }
