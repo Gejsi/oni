@@ -30,7 +30,7 @@ pub fn run() -> Result<(), OniError> {
             for entry in manifest.entries {
                 println!(
                     "{}\t{}\t{}",
-                    entry.kind.as_str(),
+                    entry.kind,
                     entry.metadata.len,
                     entry.path.display()
                 );

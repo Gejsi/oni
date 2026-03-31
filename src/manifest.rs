@@ -1,3 +1,4 @@
+use std::fmt;
 use std::fs::{self, Metadata};
 use std::path::{Path, PathBuf};
 
@@ -10,15 +11,15 @@ use crate::error::ManifestError;
 /// This is the smallest useful unit for a sync inventory. A path may later
 /// refer to a directory, symlink, device, or something else, but that policy
 /// does not belong in the first version of the scanner
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum EntryKind {
     File,
 }
 
-impl EntryKind {
-    pub fn as_str(&self) -> &'static str {
+impl fmt::Display for EntryKind {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::File => "file",
+            Self::File => f.write_str("file"),
         }
     }
 }
@@ -91,14 +92,20 @@ impl ManifestEntry {
     }
 }
 
-/// The kind of root scanned into the manifest
-///
-/// This tells later code whether the manifest came from one file or from a
-/// directory tree
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+/// Whether the scan root comes from a file or from a directory
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ManifestRoot {
     File,
     Directory,
+}
+
+impl fmt::Display for ManifestRoot {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::File => f.write_str("file"),
+            Self::Directory => f.write_str("directory"),
+        }
+    }
 }
 
 /// A stable inventory of regular files under a scan root
