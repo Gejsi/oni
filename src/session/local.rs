@@ -7,6 +7,7 @@ use crate::fs as fs_ops;
 use crate::manifest::{Manifest, ManifestRoot};
 use crate::path::LocalEndpoint;
 use crate::plan::{Operation, Plan, PlanOptions};
+use crate::strategy::fixed;
 
 use super::{Change, ChangeKind, Options};
 
@@ -47,6 +48,7 @@ pub(super) fn apply(
         &prepared.source_manifest,
         prepared.destination_manifest.as_ref(),
         &prepared.plan,
+        options,
     )?;
 
     build_changes(
@@ -128,6 +130,7 @@ fn execute_plan(
     source_manifest: &Manifest,
     destination_manifest: Option<&Manifest>,
     plan: &Plan,
+    options: &Options,
 ) -> Result<(), SessionError> {
     for operation in &plan.operations {
         match *operation {
@@ -148,7 +151,7 @@ fn execute_plan(
                     source_index,
                     destination_index,
                 )?;
-                fs_ops::replace_file(&source_path, &destination_path)?;
+                apply_data_update(&source_path, &destination_path, options)?;
             }
             Operation::UpdateMetadata {
                 source_index,
@@ -181,6 +184,67 @@ fn execute_plan(
     }
 
     Ok(())
+}
+
+fn apply_data_update(
+    source_path: &Path,
+    destination_path: &Path,
+    options: &Options,
+) -> Result<(), SessionError> {
+    match options.strategy {
+        super::Strategy::Fixed => apply_fixed_delta_update(source_path, destination_path),
+        super::Strategy::Auto | super::Strategy::Whole | super::Strategy::Cdc => {
+            fs_ops::replace_file(source_path, destination_path)
+        }
+    }
+}
+
+fn apply_fixed_delta_update(
+    source_path: &Path,
+    destination_path: &Path,
+) -> Result<(), SessionError> {
+    let source_len = std::fs::metadata(source_path)
+        .map_err(|source| SessionError::ApplyIo {
+            operation: "read source metadata for fixed delta",
+            path: source_path.to_path_buf(),
+            source,
+        })?
+        .len();
+    let destination_len = std::fs::metadata(destination_path)
+        .map_err(|source| SessionError::ApplyIo {
+            operation: "read destination metadata for fixed delta",
+            path: destination_path.to_path_buf(),
+            source,
+        })?
+        .len();
+    let block_size = fixed::choose_block_size(source_len, destination_len);
+
+    let mut basis_signature_file =
+        File::open(destination_path).map_err(|source| SessionError::ApplyIo {
+            operation: "open destination basis file for fixed delta",
+            path: destination_path.to_path_buf(),
+            source,
+        })?;
+    let signatures = fixed::signatures(&mut basis_signature_file, block_size)?;
+
+    let mut source_file = File::open(source_path).map_err(|source| SessionError::ApplyIo {
+        operation: "open source file for fixed delta",
+        path: source_path.to_path_buf(),
+        source,
+    })?;
+    let recipe = fixed::delta(&mut source_file, &signatures)?;
+
+    fs_ops::replace_with_writer(source_path, destination_path, |writer| {
+        let mut basis_apply_file =
+            File::open(destination_path).map_err(|source| SessionError::ApplyIo {
+                operation: "reopen destination basis file for fixed delta apply",
+                path: destination_path.to_path_buf(),
+                source,
+            })?;
+
+        fixed::apply(&recipe, &mut basis_apply_file, writer)?;
+        Ok(())
+    })
 }
 
 fn build_changes(
@@ -609,6 +673,35 @@ mod tests {
         assert_eq!(applied.operations.len(), 1);
         assert_eq!(applied.operations[0].kind.to_string(), "update-data");
         assert_eq!(fs::read(&destination).unwrap(), b"aaa");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn applies_explicit_fixed_strategy_for_local_updates() {
+        let root = temp_path("session-apply-fixed-strategy");
+        fs::create_dir_all(&root).unwrap();
+
+        let source = root.join("alpha.txt");
+        let destination = root.join("beta.txt");
+        fs::write(&source, b"zzabcd1234wxyzyy").unwrap();
+        fs::write(&destination, b"abcd1234wxyz").unwrap();
+
+        let request = Request::from_args(
+            &source.to_string_lossy(),
+            &destination.to_string_lossy(),
+            Options {
+                strategy: Strategy::Fixed,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        let applied = request.apply().unwrap();
+
+        assert_eq!(applied.operations.len(), 1);
+        assert_eq!(applied.operations[0].kind.to_string(), "update-data");
+        assert_eq!(fs::read(&destination).unwrap(), b"zzabcd1234wxyzyy");
 
         fs::remove_dir_all(root).unwrap();
     }

@@ -6,3 +6,5 @@ pub mod path;
 pub mod plan;
 pub mod protocol;
 pub mod session;
+pub mod strategy;
+pub mod transport;

@@ -82,6 +82,23 @@ pub enum PeerRole {
     Helper,
 }
 
+impl PeerRole {
+    fn from_wire(value: u8) -> Result<Self, ProtocolError> {
+        match value {
+            1 => Ok(Self::Coordinator),
+            2 => Ok(Self::Helper),
+            _ => Err(ProtocolError::UnknownPeerRole { value }),
+        }
+    }
+
+    fn wire_id(self) -> u8 {
+        match self {
+            Self::Coordinator => 1,
+            Self::Helper => 2,
+        }
+    }
+}
+
 impl fmt::Display for PeerRole {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -135,6 +152,24 @@ impl Capability {
     pub const fn id(self) -> u16 {
         self as u16
     }
+
+    fn from_id(id: u16) -> Result<Self, ProtocolError> {
+        match id {
+            0x0001 => Ok(Self::WholeFileTransfer),
+            0x0002 => Ok(Self::FixedDeltaTransfer),
+            0x0003 => Ok(Self::CdcDeltaTransfer),
+            0x0100 => Ok(Self::FixedChunker),
+            0x0101 => Ok(Self::FastCdcChunker),
+            0x0102 => Ok(Self::SeqCdcChunker),
+            0x0300 => Ok(Self::Symlink),
+            0x0301 => Ok(Self::Xattr),
+            0x0302 => Ok(Self::Acl),
+            0x0400 => Ok(Self::Compression),
+            0x0401 => Ok(Self::Resume),
+            0x0500 => Ok(Self::StructuredStats),
+            _ => Err(ProtocolError::UnknownCapabilityId { id }),
+        }
+    }
 }
 
 impl fmt::Display for Capability {
@@ -174,6 +209,10 @@ impl CapabilitySet {
 
     pub fn intersection(&self, other: &Self) -> Self {
         Self::new(self.inner.intersection(&other.inner).copied())
+    }
+
+    pub fn len(&self) -> usize {
+        self.inner.len()
     }
 
     pub fn iter(&self) -> impl Iterator<Item = Capability> + '_ {
@@ -274,6 +313,9 @@ pub struct Limits {
 }
 
 impl Limits {
+    pub const DEFAULT_MAX_FRAME_BYTES: u32 = 8 * 1024 * 1024;
+    pub const DEFAULT_MAX_CHUNK_BYTES: u32 = 4 * 1024 * 1024;
+
     pub fn new(max_frame_bytes: u32, max_chunk_bytes: u32) -> Result<Self, ProtocolError> {
         if max_frame_bytes == 0 {
             return Err(ProtocolError::InvalidLimit {
@@ -307,6 +349,15 @@ impl Limits {
         Self {
             max_frame_bytes: self.max_frame_bytes.min(other.max_frame_bytes),
             max_chunk_bytes: self.max_chunk_bytes.min(other.max_chunk_bytes),
+        }
+    }
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_frame_bytes: Self::DEFAULT_MAX_FRAME_BYTES,
+            max_chunk_bytes: Self::DEFAULT_MAX_CHUNK_BYTES,
         }
     }
 }
@@ -377,6 +428,73 @@ impl Hello {
             remote_implementation: remote.implementation.clone(),
         })
     }
+
+    fn encode_body(&self) -> Result<Vec<u8>, ProtocolError> {
+        let mut encoded = Vec::new();
+
+        encoded.push(self.role.wire_id());
+        encoded.extend_from_slice(&self.versions.min().as_u16().to_be_bytes());
+        encoded.extend_from_slice(&self.versions.max().as_u16().to_be_bytes());
+        encoded.extend_from_slice(&self.limits.max_frame_bytes().to_be_bytes());
+        encoded.extend_from_slice(&self.limits.max_chunk_bytes().to_be_bytes());
+        push_text_field(
+            &mut encoded,
+            "Hello",
+            "implementation-name",
+            &self.implementation.name,
+        )?;
+        push_text_field(
+            &mut encoded,
+            "Hello",
+            "implementation-version",
+            &self.implementation.version,
+        )?;
+
+        let capability_count =
+            u16::try_from(self.capabilities.len()).map_err(|_| ProtocolError::FieldTooLarge {
+                message: "Hello",
+                field: "capabilities",
+                len: self.capabilities.len(),
+            })?;
+        encoded.extend_from_slice(&capability_count.to_be_bytes());
+        for capability in self.capabilities.iter() {
+            encoded.extend_from_slice(&capability.id().to_be_bytes());
+        }
+
+        Ok(encoded)
+    }
+
+    fn decode_body(encoded: &[u8]) -> Result<Self, ProtocolError> {
+        let mut cursor = Cursor::new("Hello", encoded);
+
+        let role = PeerRole::from_wire(cursor.read_u8("role")?)?;
+        let versions = VersionRange::new(
+            ProtocolVersion::new(cursor.read_u16("min-version")?),
+            ProtocolVersion::new(cursor.read_u16("max-version")?),
+        )?;
+        let limits = Limits::new(
+            cursor.read_u32("max-frame-bytes")?,
+            cursor.read_u32("max-chunk-bytes")?,
+        )?;
+        let implementation = ImplementationInfo::new(
+            cursor.read_string("implementation-name")?,
+            cursor.read_string("implementation-version")?,
+        );
+
+        let capability_count = cursor.read_u16("capability-count")?;
+        let mut capabilities = Vec::with_capacity(capability_count as usize);
+        for _ in 0..capability_count {
+            capabilities.push(Capability::from_id(cursor.read_u16("capability-id")?)?);
+        }
+
+        Ok(Self {
+            role,
+            implementation,
+            versions,
+            capabilities: CapabilitySet::new(capabilities),
+            limits,
+        })
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -405,11 +523,139 @@ impl NegotiatedSession {
     }
 }
 
+pub fn current_implementation() -> ImplementationInfo {
+    ImplementationInfo::new("oni", env!("CARGO_PKG_VERSION"))
+}
+
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[repr(u16)]
+pub enum MessageKind {
+    Hello = 1,
+}
+
+impl MessageKind {
+    pub const fn id(self) -> u16 {
+        self as u16
+    }
+
+    fn from_id(id: u16) -> Result<Self, ProtocolError> {
+        match id {
+            1 => Ok(Self::Hello),
+            _ => Err(ProtocolError::UnknownMessageKind { kind: id }),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Message {
+    Hello(Hello),
+}
+
+impl Message {
+    pub fn encode(&self) -> Result<Vec<u8>, ProtocolError> {
+        match self {
+            Self::Hello(hello) => {
+                let mut encoded = Vec::new();
+                encoded.extend_from_slice(&MessageKind::Hello.id().to_be_bytes());
+                encoded.extend_from_slice(&hello.encode_body()?);
+                Ok(encoded)
+            }
+        }
+    }
+
+    pub fn decode(encoded: &[u8]) -> Result<Self, ProtocolError> {
+        let mut cursor = Cursor::new("Message", encoded);
+        let kind = MessageKind::from_id(cursor.read_u16("kind")?)?;
+        let body = cursor.remaining();
+
+        match kind {
+            MessageKind::Hello => Ok(Self::Hello(Hello::decode_body(body)?)),
+        }
+    }
+}
+
+fn push_text_field(
+    encoded: &mut Vec<u8>,
+    message: &'static str,
+    field: &'static str,
+    value: &str,
+) -> Result<(), ProtocolError> {
+    let bytes = value.as_bytes();
+    let len = u16::try_from(bytes.len()).map_err(|_| ProtocolError::FieldTooLarge {
+        message,
+        field,
+        len: bytes.len(),
+    })?;
+
+    encoded.extend_from_slice(&len.to_be_bytes());
+    encoded.extend_from_slice(bytes);
+
+    Ok(())
+}
+
+struct Cursor<'a> {
+    message: &'static str,
+    bytes: &'a [u8],
+    offset: usize,
+}
+
+impl<'a> Cursor<'a> {
+    fn new(message: &'static str, bytes: &'a [u8]) -> Self {
+        Self {
+            message,
+            bytes,
+            offset: 0,
+        }
+    }
+
+    fn read_u8(&mut self, field: &'static str) -> Result<u8, ProtocolError> {
+        let bytes = self.read_bytes(field, 1)?;
+        Ok(bytes[0])
+    }
+
+    fn read_u16(&mut self, field: &'static str) -> Result<u16, ProtocolError> {
+        let bytes = self.read_bytes(field, 2)?;
+        Ok(u16::from_be_bytes([bytes[0], bytes[1]]))
+    }
+
+    fn read_u32(&mut self, field: &'static str) -> Result<u32, ProtocolError> {
+        let bytes = self.read_bytes(field, 4)?;
+        Ok(u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
+    }
+
+    fn read_string(&mut self, field: &'static str) -> Result<String, ProtocolError> {
+        let len = self.read_u16(field)? as usize;
+        let bytes = self.read_bytes(field, len)?;
+
+        String::from_utf8(bytes.to_vec()).map_err(|_| ProtocolError::InvalidTextField {
+            message: self.message,
+            field,
+        })
+    }
+
+    fn read_bytes(&mut self, field: &'static str, len: usize) -> Result<&'a [u8], ProtocolError> {
+        if self.offset + len > self.bytes.len() {
+            return Err(ProtocolError::TruncatedMessage {
+                message: self.message,
+                field,
+            });
+        }
+
+        let bytes = &self.bytes[self.offset..self.offset + len];
+        self.offset += len;
+        Ok(bytes)
+    }
+
+    fn remaining(&self) -> &'a [u8] {
+        &self.bytes[self.offset..]
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        Capability, CapabilitySet, ChunkerId, Hello, ImplementationInfo, Limits, OperationKind,
-        PeerRole, ProtocolVersion, VersionRange,
+        current_implementation, Capability, CapabilitySet, ChunkerId, Hello, ImplementationInfo,
+        Limits, Message, OperationKind, PeerRole, ProtocolVersion, VersionRange,
     };
     use crate::error::ProtocolError;
 
@@ -561,5 +807,40 @@ mod tests {
         assert_eq!(Capability::FastCdcChunker.id(), 0x0101);
         assert_eq!(ChunkerId::SeqCdc.id(), 3);
         assert_eq!(OperationKind::DeleteDirectory.id(), 5);
+    }
+
+    #[test]
+    fn round_trips_hello_messages() {
+        let hello = Hello::for_current(
+            PeerRole::Coordinator,
+            current_implementation(),
+            CapabilitySet::from([Capability::WholeFileTransfer, Capability::FastCdcChunker]),
+            Limits::default(),
+        );
+
+        let encoded = Message::Hello(hello.clone()).encode().unwrap();
+        let decoded = Message::decode(&encoded).unwrap();
+
+        assert_eq!(decoded, Message::Hello(hello));
+    }
+
+    #[test]
+    fn rejects_unknown_capability_ids_during_message_decode() {
+        let mut encoded = Message::Hello(Hello::for_current(
+            PeerRole::Coordinator,
+            current_implementation(),
+            CapabilitySet::from([Capability::WholeFileTransfer]),
+            Limits::default(),
+        ))
+        .encode()
+        .unwrap();
+
+        let length = encoded.len();
+        encoded[length - 2] = 0x99;
+        encoded[length - 1] = 0x99;
+
+        let error = Message::decode(&encoded).unwrap_err();
+
+        assert_eq!(error, ProtocolError::UnknownCapabilityId { id: 0x9999 });
     }
 }

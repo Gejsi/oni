@@ -1,9 +1,13 @@
+use std::io;
+
 use clap::Parser;
 
 use oni::cli::{Cli, Command, InternalSubcommand, RunArgs};
 use oni::error::OniError;
 use oni::manifest::Manifest;
+use oni::protocol::{current_implementation, CapabilitySet, Hello, Limits, Message, PeerRole};
 use oni::session::{Preview, Request};
+use oni::transport::stdio::Connection;
 
 fn main() -> Result<(), OniError> {
     let cli = Cli::parse();
@@ -24,12 +28,37 @@ fn main() -> Result<(), OniError> {
             Ok(())
         }
         Some(Command::Internal(command)) => match command.command {
-            InternalSubcommand::Serve(_) => {
-                Err(oni::error::SessionError::ServeNotImplemented.into())
-            }
+            InternalSubcommand::Serve(_) => serve_stdio(),
         },
         None => run(cli.run),
     }
+}
+
+fn serve_stdio() -> Result<(), OniError> {
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut connection = Connection::new(
+        stdin.lock(),
+        stdout.lock(),
+        Limits::default().max_frame_bytes() as usize,
+    );
+
+    let Some(frame) = connection.receive_frame()? else {
+        return Ok(());
+    };
+    let Message::Hello(remote_hello) = Message::decode(&frame)?;
+
+    let local_hello = Hello::for_current(
+        PeerRole::Helper,
+        current_implementation(),
+        CapabilitySet::default(),
+        Limits::default(),
+    );
+
+    Hello::negotiate(&local_hello, &remote_hello)?;
+    connection.send_frame(&Message::Hello(local_hello).encode()?)?;
+
+    Ok(())
 }
 
 fn run(args: RunArgs) -> Result<(), OniError> {

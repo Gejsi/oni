@@ -17,6 +17,10 @@ pub enum OniError {
     #[error(transparent)]
     Protocol(#[from] ProtocolError),
     #[error(transparent)]
+    Transport(#[from] TransportError),
+    #[error(transparent)]
+    Strategy(#[from] StrategyError),
+    #[error(transparent)]
     Session(#[from] SessionError),
 }
 
@@ -85,6 +89,62 @@ pub enum ProtocolError {
     },
     #[error("missing required negotiated capability: {capability}")]
     MissingRequiredCapability { capability: Capability },
+    #[error("unknown protocol message kind: {kind}")]
+    UnknownMessageKind { kind: u16 },
+    #[error("unknown peer role id in hello: {value}")]
+    UnknownPeerRole { value: u8 },
+    #[error("unknown capability id in hello: {id}")]
+    UnknownCapabilityId { id: u16 },
+    #[error("truncated protocol message {message} while reading {field}")]
+    TruncatedMessage {
+        message: &'static str,
+        field: &'static str,
+    },
+    #[error("invalid UTF-8 in protocol message {message} field {field}")]
+    InvalidTextField {
+        message: &'static str,
+        field: &'static str,
+    },
+    #[error("protocol message {message} field {field} is too large: {len} bytes")]
+    FieldTooLarge {
+        message: &'static str,
+        field: &'static str,
+        len: usize,
+    },
+}
+
+#[derive(Debug, Error)]
+pub enum TransportError {
+    #[error("failed to {operation} on stdio transport")]
+    Io {
+        operation: &'static str,
+        #[source]
+        source: io::Error,
+    },
+    #[error("stdio frame is too large: {len} bytes exceeds the configured maximum {max}")]
+    FrameTooLarge { len: usize, max: usize },
+    #[error("unexpected EOF while trying to {operation} on stdio transport")]
+    UnexpectedEof { operation: &'static str },
+    #[error("failed to launch helper process: {target}")]
+    Launch {
+        target: String,
+        #[source]
+        source: io::Error,
+    },
+    #[error("helper process did not expose piped {pipe}: {target}")]
+    MissingPipe { pipe: &'static str, target: String },
+}
+
+#[derive(Debug, Error)]
+pub enum StrategyError {
+    #[error("failed to {operation} during fixed-size delta processing")]
+    Io {
+        operation: &'static str,
+        #[source]
+        source: io::Error,
+    },
+    #[error("fixed-size delta recipe references a missing basis block: {block_index}")]
+    InvalidBlockReference { block_index: usize },
 }
 
 #[derive(Debug, Error)]
@@ -93,6 +153,8 @@ pub enum SessionError {
     Manifest(#[from] ManifestError),
     #[error(transparent)]
     Plan(#[from] PlanError),
+    #[error(transparent)]
+    Strategy(#[from] StrategyError),
     #[error("failed to access file during checksum preview: {path}")]
     ChecksumIo {
         path: PathBuf,
@@ -114,6 +176,4 @@ pub enum SessionError {
     MissingSourceName { path: PathBuf },
     #[error("source and destination paths are required")]
     MissingOperands,
-    #[error("internal stdio helper mode is not implemented yet")]
-    ServeNotImplemented,
 }
