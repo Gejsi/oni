@@ -1,3 +1,8 @@
+//! Backend-independent preview data structures.
+//!
+//! The CLI prints these values without needing to know whether they came from a
+//! local backend or a future SSH-backed helper session.
+
 use std::fmt;
 use std::path::PathBuf;
 

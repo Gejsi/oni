@@ -1,3 +1,5 @@
+//! Integration tests for the user-facing local sync CLI.
+
 use std::fs;
 use std::path::PathBuf;
 use std::process::Command;

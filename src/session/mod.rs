@@ -1,3 +1,9 @@
+//! Session-level orchestration.
+//!
+//! This module owns user-visible sync options and dispatch. Backend-specific
+//! filesystem work stays in `session::local`, while this front door keeps the
+//! public request type small and transport-agnostic.
+
 mod local;
 mod preview;
 
@@ -48,17 +54,10 @@ impl Request {
             (Endpoint::Local(source), Endpoint::Local(destination)) => {
                 local::preview(source, destination, &self.options)?
             }
-            _ => {
-                return Err(SessionError::UnsupportedMode {
-                    mode: self.mode().to_string(),
-                });
-            }
+            _ => return Err(self.unsupported_mode()),
         };
 
-        Ok(Preview {
-            mode: self.mode(),
-            operations,
-        })
+        Ok(self.finish(operations))
     }
 
     pub fn apply(&self) -> Result<Preview, SessionError> {
@@ -66,17 +65,23 @@ impl Request {
             (Endpoint::Local(source), Endpoint::Local(destination)) => {
                 local::apply(source, destination, &self.options)?
             }
-            _ => {
-                return Err(SessionError::UnsupportedMode {
-                    mode: self.mode().to_string(),
-                });
-            }
+            _ => return Err(self.unsupported_mode()),
         };
 
-        Ok(Preview {
+        Ok(self.finish(operations))
+    }
+
+    fn finish(&self, operations: Vec<Change>) -> Preview {
+        Preview {
             mode: self.mode(),
             operations,
-        })
+        }
+    }
+
+    fn unsupported_mode(&self) -> SessionError {
+        SessionError::UnsupportedMode {
+            mode: self.mode().to_string(),
+        }
     }
 }
 

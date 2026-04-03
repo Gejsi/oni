@@ -1,3 +1,10 @@
+//! Local-only session backend for the current `v2` implementation.
+//!
+//! The file stays intentionally small:
+//! - prepare manifests and a plan
+//! - execute local filesystem changes
+//! - translate operations into user-facing preview output
+
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
@@ -72,6 +79,11 @@ fn prepare(
     options: &Options,
     verify_contents: bool,
 ) -> Result<PreparedPlan, SessionError> {
+    // The local backend always follows the same sequence:
+    // 1. scan source
+    // 2. scan/resolve destination
+    // 3. build a cheap metadata plan
+    // 4. optionally upgrade equal-size matches after content verification
     let source_manifest = Manifest::scan(&source.path)?;
     let destination_manifest = scan_destination_manifest(source, destination, &source_manifest)?;
     let mut plan = Plan::build(
@@ -132,6 +144,9 @@ fn execute_plan(
     plan: &Plan,
     options: &Options,
 ) -> Result<(), SessionError> {
+    // The local executor keeps one simple rule: planned file operations run in
+    // order, and each individual file change is crash-safe because `fs.rs`
+    // always writes through a sibling temp file before rename.
     for operation in &plan.operations {
         match *operation {
             Operation::Create { source_index } => {
@@ -175,6 +190,9 @@ fn execute_plan(
                     destination_index,
                 )?;
                 fs_ops::remove_file(&destination_path)?;
+                if source_manifest.root == ManifestRoot::Directory {
+                    fs_ops::prune_empty_parent_directories(&destination_path, &destination.path)?;
+                }
             }
             Operation::Skip {
                 source_index: _,
@@ -191,11 +209,16 @@ fn apply_data_update(
     destination_path: &Path,
     options: &Options,
 ) -> Result<(), SessionError> {
+    // Strategy dispatch stays here instead of in `fs.rs` so the filesystem
+    // helpers remain dumb and reusable.
     match options.strategy {
         super::Strategy::Fixed => apply_fixed_delta_update(source_path, destination_path),
-        super::Strategy::Auto | super::Strategy::Whole | super::Strategy::Cdc => {
+        super::Strategy::Auto | super::Strategy::Whole => {
             fs_ops::replace_file(source_path, destination_path)
         }
+        super::Strategy::Cdc => Err(SessionError::UnsupportedStrategy {
+            strategy: options.strategy.to_string(),
+        }),
     }
 }
 
@@ -203,6 +226,9 @@ fn apply_fixed_delta_update(
     source_path: &Path,
     destination_path: &Path,
 ) -> Result<(), SessionError> {
+    // The destination file is both:
+    // - the basis used to compute signatures and copy references
+    // - the path that will be atomically replaced once the recipe is applied
     let source_len = std::fs::metadata(source_path)
         .map_err(|source| SessionError::ApplyIo {
             operation: "read source metadata for fixed delta",
@@ -254,6 +280,8 @@ fn build_changes(
     destination_manifest: Option<&Manifest>,
     plan: &Plan,
 ) -> Result<Vec<Change>, SessionError> {
+    // Preview output uses logical destination paths, not internal manifest
+    // indices, so the CLI can print one stable path per operation.
     match source_manifest.root {
         ManifestRoot::Directory => plan
             .operations
@@ -415,6 +443,8 @@ fn matched_operation_paths(
     source_index: usize,
     destination_index: usize,
 ) -> Result<(PathBuf, PathBuf), SessionError> {
+    // Directory roots compare relative paths inside each root.
+    // File roots compare exactly one logical source/destination item.
     match source_manifest.root {
         ManifestRoot::Directory => Ok((
             source
@@ -446,6 +476,9 @@ fn delete_operation_path(
 }
 
 fn files_match(source: &Path, destination: &Path) -> Result<bool, SessionError> {
+    // This is a streaming byte comparison, not a hashing pass. It is used only
+    // when the session explicitly needs content verification for equal-size
+    // matches.
     let mut source_file = File::open(source).map_err(|source_error| SessionError::ChecksumIo {
         path: source.to_path_buf(),
         source: source_error,
@@ -495,6 +528,7 @@ mod tests {
     use std::thread;
     use std::time::{Duration, UNIX_EPOCH};
 
+    use crate::error::SessionError;
     use crate::path::temp_path;
     use crate::session::{Chunker, Options, Request, Strategy};
 
@@ -707,6 +741,37 @@ mod tests {
     }
 
     #[test]
+    fn rejects_explicit_cdc_strategy_until_delta_execution_exists() {
+        let root = temp_path("session-apply-cdc-strategy");
+        fs::create_dir_all(&root).unwrap();
+
+        let source = root.join("alpha.txt");
+        let destination = root.join("beta.txt");
+        fs::write(&source, b"source").unwrap();
+        fs::write(&destination, b"destin").unwrap();
+
+        let request = Request::from_args(
+            &source.to_string_lossy(),
+            &destination.to_string_lossy(),
+            Options {
+                strategy: Strategy::Cdc,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        let error = request.apply().unwrap_err();
+
+        assert!(matches!(
+            error,
+            SessionError::UnsupportedStrategy { strategy } if strategy == "cdc"
+        ));
+        assert_eq!(fs::read(&destination).unwrap(), b"destin");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
     fn applies_metadata_only_updates_without_rewriting_file_contents() {
         let root = temp_path("session-apply-metadata");
         fs::create_dir_all(&root).unwrap();
@@ -780,6 +845,34 @@ mod tests {
         assert_eq!(applied.summary().delete, 1);
         assert!(!destination.join("remove.txt").exists());
         assert!(destination.join("keep.txt").exists());
+
+        fs::remove_dir_all(source).unwrap();
+        fs::remove_dir_all(destination).unwrap();
+    }
+
+    #[test]
+    fn removes_empty_destination_directories_after_deletes() {
+        let source = temp_path("session-apply-prune-source");
+        let destination = temp_path("session-apply-prune-destination");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(destination.join("nested")).unwrap();
+        fs::write(destination.join("nested/remove.txt"), b"remove").unwrap();
+
+        let request = Request::from_args(
+            &source.to_string_lossy(),
+            &destination.to_string_lossy(),
+            Options {
+                delete_extraneous: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        let applied = request.apply().unwrap();
+
+        assert_eq!(applied.summary().delete, 1);
+        assert!(destination.exists());
+        assert!(!destination.join("nested").exists());
 
         fs::remove_dir_all(source).unwrap();
         fs::remove_dir_all(destination).unwrap();

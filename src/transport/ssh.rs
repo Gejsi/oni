@@ -1,3 +1,8 @@
+//! SSH helper launch wrapper.
+//!
+//! This module only builds and spawns the helper process. Session logic and
+//! protocol semantics live above it.
+
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 
 use crate::error::TransportError;
@@ -13,6 +18,8 @@ pub struct Invocation {
 
 impl Invocation {
     pub fn helper(endpoint: &RemoteEndpoint) -> Self {
+        // SSH is only the launch boundary. The helper itself always speaks the
+        // internal stdio protocol once the process is running.
         Self {
             program: "ssh".to_string(),
             args: vec![
@@ -49,6 +56,8 @@ pub fn launch_helper(endpoint: &RemoteEndpoint) -> Result<LaunchedHelper, Transp
 }
 
 fn launch_invocation(invocation: Invocation) -> Result<LaunchedHelper, TransportError> {
+    // Build one human-readable target string so launch and missing-pipe errors
+    // point at the exact helper command the session tried to start.
     let target = if invocation.args.is_empty() {
         invocation.program.clone()
     } else {

@@ -1,3 +1,8 @@
+//! Typed error definitions for the current `v2` codebase.
+//!
+//! The goal is to keep domain failures specific near their source and only
+//! collapse them into `OniError` at the binary boundary.
+
 use std::io;
 use std::path::{PathBuf, StripPrefixError};
 
@@ -193,6 +198,8 @@ pub enum SessionError {
         #[source]
         source: io::Error,
     },
+    #[error("transfer strategy is not implemented yet: {strategy}")]
+    UnsupportedStrategy { strategy: String },
     #[error("mode is not implemented yet: {mode}")]
     UnsupportedMode { mode: String },
     #[error("cannot preview delete operations without a destination manifest")]

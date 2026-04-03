@@ -1,3 +1,5 @@
+//! Framed stdio transport used by local and SSH-spawned helpers.
+
 use std::io::{Read, Write};
 
 use crate::error::TransportError;
@@ -24,6 +26,9 @@ impl<R, W> Connection<R, W> {
 
 impl<R: Read, W: Write> Connection<R, W> {
     pub fn send_frame(&mut self, payload: &[u8]) -> Result<(), TransportError> {
+        // The frame format is:
+        // - 4-byte big-endian length prefix
+        // - raw payload bytes
         if payload.len() > self.max_frame_bytes {
             return Err(TransportError::FrameTooLarge {
                 len: payload.len(),
@@ -58,6 +63,8 @@ impl<R: Read, W: Write> Connection<R, W> {
     }
 
     pub fn receive_frame(&mut self) -> Result<Option<Vec<u8>>, TransportError> {
+        // `None` means clean EOF before a new frame started.
+        // Any EOF after a partial prefix becomes an explicit transport error.
         let Some(length_prefix) = read_length_prefix(&mut self.reader)? else {
             return Ok(None);
         };
@@ -87,6 +94,8 @@ fn read_length_prefix<R: Read>(reader: &mut R) -> Result<Option<[u8; 4]>, Transp
     let mut offset = 0;
 
     while offset < prefix.len() {
+        // Plain `read_exact` would collapse clean EOF and truncated prefix into
+        // the same error. This loop keeps those cases distinct.
         let read = reader
             .read(&mut prefix[offset..])
             .map_err(|source| TransportError::Io {

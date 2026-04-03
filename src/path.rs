@@ -1,4 +1,10 @@
+//! Endpoint parsing for the public CLI.
+//!
+//! This module keeps the user-facing path rules in one place so session code
+//! does not need to guess whether a value is local or remote.
+
 use std::path::PathBuf;
+#[cfg(test)]
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::PathError;
@@ -58,6 +64,7 @@ impl std::fmt::Display for RemoteEndpoint {
     }
 }
 
+/// Parse a CLI endpoint into a typed local or remote form.
 pub fn parse_endpoint(spec: &str) -> Result<Endpoint, PathError> {
     if let Some(remote) = try_parse_remote(spec)? {
         return Ok(Endpoint::Remote(remote));
@@ -128,13 +135,14 @@ fn looks_like_windows_drive(spec: &str) -> bool {
     bytes.len() >= 3 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic()
 }
 
+#[cfg(test)]
 // Tests create real trees on disk.
 // The label keeps leftover paths readable when a case fails.
-pub fn temp_path(label: &str) -> PathBuf {
+pub(crate) fn temp_path(label: &str) -> PathBuf {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_nanos();
+        .map(|duration| duration.as_nanos())
+        .unwrap_or(0);
 
     std::env::temp_dir().join(format!("oni-{label}-{unique}"))
 }

@@ -1,3 +1,9 @@
+//! Internal stdio helper protocol.
+//!
+//! This module is deliberately small: it defines versioning, capabilities,
+//! negotiated limits, and message encoding without pulling transport or sync
+//! execution concerns into the wire schema.
+
 use std::collections::BTreeSet;
 use std::fmt;
 
@@ -35,6 +41,7 @@ pub struct VersionRange {
 }
 
 impl VersionRange {
+    /// Construct an inclusive supported-version range.
     pub fn new(min: ProtocolVersion, max: ProtocolVersion) -> Result<Self, ProtocolError> {
         if min > max {
             return Err(ProtocolError::InvalidVersionRange { min, max });
@@ -59,6 +66,9 @@ impl VersionRange {
     }
 
     pub fn highest_shared(self, other: Self) -> Option<ProtocolVersion> {
+        // Sessions always choose the highest mutually supported protocol
+        // version so new peers can still talk to older ones when their ranges
+        // overlap.
         let min = self.min.max(other.min);
         let max = self.max.min(other.max);
 
@@ -404,6 +414,8 @@ impl Hello {
     }
 
     pub fn negotiate(local: &Self, remote: &Self) -> Result<NegotiatedSession, ProtocolError> {
+        // A session needs exactly one coordinator and one helper. Reject same-
+        // role handshakes before comparing any other fields.
         if local.role == remote.role {
             return Err(ProtocolError::IncompatibleRoles {
                 local: local.role,
@@ -418,6 +430,8 @@ impl Hello {
             },
         )?;
 
+        // Versions gate wire compatibility. Capabilities and limits then refine
+        // what this specific session is allowed to do.
         Ok(NegotiatedSession {
             version,
             capabilities: local.capabilities.intersection(&remote.capabilities),
@@ -430,6 +444,8 @@ impl Hello {
     }
 
     fn encode_body(&self) -> Result<Vec<u8>, ProtocolError> {
+        // The wire layout is intentionally simple and fixed-width where
+        // possible. That keeps decoding small and avoids schema machinery.
         let mut encoded = Vec::new();
 
         encoded.push(self.role.wire_id());
@@ -564,6 +580,8 @@ impl Message {
     }
 
     pub fn decode(encoded: &[u8]) -> Result<Self, ProtocolError> {
+        // Messages start with a numeric kind id so the transport layer never
+        // needs to understand their semantics.
         let mut cursor = Cursor::new("Message", encoded);
         let kind = MessageKind::from_id(cursor.read_u16("kind")?)?;
         let body = cursor.remaining();
@@ -634,6 +652,7 @@ impl<'a> Cursor<'a> {
     }
 
     fn read_bytes(&mut self, field: &'static str, len: usize) -> Result<&'a [u8], ProtocolError> {
+        // A tiny cursor keeps binary decoding explicit and easy to audit.
         if self.offset + len > self.bytes.len() {
             return Err(ProtocolError::TruncatedMessage {
                 message: self.message,

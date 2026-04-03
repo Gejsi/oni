@@ -1,3 +1,8 @@
+//! CLI surface for the `oni` binary.
+//!
+//! The default command shape is `oni <SOURCE> <DESTINATION>`. Hidden
+//! subcommands exist only for internal helpers and debugging entry points.
+
 use std::path::PathBuf;
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
@@ -75,6 +80,8 @@ pub struct RunArgs {
 }
 
 impl RunArgs {
+    /// Convert raw CLI flags into the session-level options object used by the
+    /// rest of the codebase.
     pub fn options(&self) -> Options {
         Options {
             dry_run: self.dry_run,
@@ -91,9 +98,13 @@ impl RunArgs {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 pub enum StrategyArg {
+    /// Let the session choose once heuristics exist.
     Auto,
+    /// Always replace changed files wholesale.
     Whole,
+    /// Use the fixed-size rsync-style delta path.
     Fixed,
+    /// Reserve the CDC path for future helper-backed execution.
     Cdc,
 }
 
@@ -110,6 +121,7 @@ impl From<StrategyArg> for Strategy {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 pub enum ChunkerArg {
+    /// Placeholder for non-CDC fixed blocking.
     Fixed,
     #[value(name = "fastcdc")]
     FastCdc,

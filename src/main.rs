@@ -1,3 +1,10 @@
+//! Binary entry point for Oni.
+//!
+//! The executable keeps only thin orchestration here:
+//! - parse CLI arguments
+//! - dispatch hidden helper/debug commands
+//! - hand real sync work to the library
+
 use std::io;
 
 use clap::Parser;
@@ -6,7 +13,7 @@ use oni::cli::{Cli, Command, InternalSubcommand, RunArgs};
 use oni::error::OniError;
 use oni::manifest::Manifest;
 use oni::protocol::{current_implementation, CapabilitySet, Hello, Limits, Message, PeerRole};
-use oni::session::{Preview, Request};
+use oni::session::{Preview, Request, Summary};
 use oni::transport::stdio::Connection;
 
 fn main() -> Result<(), OniError> {
@@ -102,12 +109,7 @@ fn print_preview(request: &Request, preview: &Preview) {
     let summary = preview.summary();
 
     if request.options.stats || request.options.verbose > 0 {
-        println!("summary\tcreate={}", summary.create);
-        println!("summary\tupdate={}", summary.update_total());
-        println!("summary\tupdate-data={}", summary.update_data);
-        println!("summary\tupdate-metadata={}", summary.update_metadata);
-        println!("summary\tdelete={}", summary.delete);
-        println!("summary\tskip={}", summary.skip);
+        print_summary(summary);
     }
 }
 
@@ -123,13 +125,15 @@ fn print_apply(request: &Request, applied: &Preview) {
     }
 
     if request.options.stats || request.options.verbose > 0 {
-        let summary = applied.summary();
-
-        println!("summary\tcreate={}", summary.create);
-        println!("summary\tupdate={}", summary.update_total());
-        println!("summary\tupdate-data={}", summary.update_data);
-        println!("summary\tupdate-metadata={}", summary.update_metadata);
-        println!("summary\tdelete={}", summary.delete);
-        println!("summary\tskip={}", summary.skip);
+        print_summary(applied.summary());
     }
+}
+
+fn print_summary(summary: Summary) {
+    println!("summary\tcreate={}", summary.create);
+    println!("summary\tupdate={}", summary.update_total());
+    println!("summary\tupdate-data={}", summary.update_data);
+    println!("summary\tupdate-metadata={}", summary.update_metadata);
+    println!("summary\tdelete={}", summary.delete);
+    println!("summary\tskip={}", summary.skip);
 }

@@ -1,16 +1,21 @@
+//! Merge-style planning between source and destination manifests.
+//!
+//! The planner stays cheap and deterministic. It compares metadata only and
+//! leaves expensive content verification to the session layer.
+
 use crate::error::PlanError;
 use crate::manifest::{Manifest, ManifestEntry, ManifestRoot};
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
 pub struct PlanOptions {
+    /// When false, destination-only paths are ignored instead of planned as deletes.
     pub delete_extraneous: bool,
 }
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Operation {
-    Create {
-        source_index: usize,
-    },
+    /// Destination path does not exist yet.
+    Create { source_index: usize },
     // The executor will need this split later: a metadata-only change can be
     // applied without resending file contents, while a data change must choose
     // a transfer strategy.
@@ -18,13 +23,14 @@ pub enum Operation {
         source_index: usize,
         destination_index: usize,
     },
+    /// File contents can stay, but metadata should be synchronized.
     UpdateMetadata {
         source_index: usize,
         destination_index: usize,
     },
-    Delete {
-        destination_index: usize,
-    },
+    /// Destination path is absent from the source manifest and should be removed.
+    Delete { destination_index: usize },
+    /// Metadata says source and destination already match.
     Skip {
         source_index: usize,
         destination_index: usize,
@@ -37,6 +43,11 @@ pub struct Plan {
 }
 
 impl Plan {
+    /// Build a deterministic sync plan by walking the sorted manifests once.
+    ///
+    /// The planner intentionally does not do expensive content verification.
+    /// That cost belongs in the session layer when the user requests
+    /// `--checksum` or when real execution must double-check equal-size files.
     pub fn build(
         source: &Manifest,
         destination: Option<&Manifest>,
@@ -138,6 +149,8 @@ fn classify_matched_entries(
     source_index: usize,
     destination_index: usize,
 ) -> Operation {
+    // Once relative paths match, only file kind/size/metadata decide which
+    // operation we need. Payload verification stays outside the pure planner.
     // A length or kind mismatch always means the file payload has to change.
     if source.kind != destination.kind || source.metadata.len != destination.metadata.len {
         return Operation::UpdateData {

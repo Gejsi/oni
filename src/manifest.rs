@@ -1,3 +1,9 @@
+//! Deterministic local filesystem inventory.
+//!
+//! Manifest scanning is intentionally narrow for early `v2`: it records regular
+//! files with the minimum metadata needed for planning and nothing transport-
+//! specific.
+
 use std::fmt;
 use std::fs::{self, Metadata};
 use std::path::{Path, PathBuf};
@@ -139,6 +145,9 @@ impl Manifest {
         }
 
         if root.is_file() {
+            // File roots are kept as one logical item. The planner later treats
+            // `oni a.txt b.txt` as one file-to-file comparison instead of a
+            // directory merge keyed by file name.
             let metadata = fs::metadata(root).map_err(|source| ManifestError::Metadata {
                 path: root.to_path_buf(),
                 source,
@@ -164,6 +173,9 @@ impl Manifest {
                     source,
                 })?;
 
+            // Early `v2` only plans regular files. Directories are implicit in
+            // the relative paths, and symlink/device handling will be added as
+            // an explicit manifest feature later instead of being guessed here.
             if !metadata.is_file() {
                 continue;
             }

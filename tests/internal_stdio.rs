@@ -1,3 +1,5 @@
+//! Integration test for the hidden stdio helper handshake.
+
 use std::process::{Command, Stdio};
 
 use oni::protocol::{

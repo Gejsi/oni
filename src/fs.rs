@@ -1,3 +1,8 @@
+//! Small filesystem helpers for the local executor.
+//!
+//! This file owns the crash-safe write path and the follow-up cleanup around
+//! deletes so session orchestration can stay small and readable.
+
 use std::ffi::OsString;
 use std::fs::{self as std_fs, File, Metadata, OpenOptions};
 use std::io;
@@ -52,8 +57,8 @@ pub fn replace_with_writer(
         })?;
 
     let mut pending = PendingFile::create(destination)?;
-    write_contents(pending.file())?;
-    apply_metadata(pending.file(), &source_metadata, destination)?;
+    write_contents(pending.file(destination)?)?;
+    apply_metadata(pending.file(destination)?, &source_metadata, destination)?;
     pending.persist(destination)
 }
 
@@ -94,6 +99,36 @@ pub fn remove_file(path: &Path) -> Result<(), SessionError> {
         source: source_error,
     })?;
     sync_parent_directory(path)
+}
+
+/// Remove empty parent directories after deleting a file, but keep the sync
+/// root itself so directory-target syncs do not disappear entirely.
+pub fn prune_empty_parent_directories(path: &Path, root: &Path) -> Result<(), SessionError> {
+    let mut current = parent_directory(path);
+
+    while current.starts_with(root) && current != root {
+        match std_fs::remove_dir(current) {
+            Ok(()) => {
+                sync_parent_directory(current)?;
+                current = parent_directory(current);
+            }
+            Err(source_error) if source_error.kind() == io::ErrorKind::DirectoryNotEmpty => {
+                break;
+            }
+            Err(source_error) if source_error.kind() == io::ErrorKind::NotFound => {
+                break;
+            }
+            Err(source_error) => {
+                return Err(SessionError::ApplyIo {
+                    operation: "remove empty destination directory",
+                    path: current.to_path_buf(),
+                    source: source_error,
+                });
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn apply_metadata(
@@ -209,17 +244,20 @@ impl PendingFile {
         })
     }
 
-    fn file(&mut self) -> &mut File {
-        self.file
-            .as_mut()
-            .expect("pending temp file is always present")
+    fn file(&mut self, destination: &Path) -> Result<&mut File, SessionError> {
+        self.file.as_mut().ok_or_else(|| SessionError::ApplyIo {
+            operation: "access temporary destination file",
+            path: destination.to_path_buf(),
+            source: io::Error::other("temporary file handle unexpectedly missing"),
+        })
     }
 
     fn persist(mut self, destination: &Path) -> Result<(), SessionError> {
-        let file = self
-            .file
-            .take()
-            .expect("pending temp file is always present");
+        let file = take_pending_file(
+            &mut self.file,
+            &self.path,
+            "sync temporary destination file",
+        )?;
         file.sync_all()
             .map_err(|source_error| SessionError::ApplyIo {
                 operation: "sync temporary destination file",
@@ -236,6 +274,18 @@ impl PendingFile {
         self.persisted = true;
         sync_parent_directory(destination)
     }
+}
+
+fn take_pending_file(
+    slot: &mut Option<File>,
+    path: &Path,
+    operation: &'static str,
+) -> Result<File, SessionError> {
+    slot.take().ok_or_else(|| SessionError::ApplyIo {
+        operation,
+        path: path.to_path_buf(),
+        source: io::Error::other("temporary file handle unexpectedly missing"),
+    })
 }
 
 impl Drop for PendingFile {

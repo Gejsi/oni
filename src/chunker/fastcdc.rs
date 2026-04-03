@@ -1,3 +1,8 @@
+//! Thin wrapper around the third-party FastCDC implementation.
+//!
+//! Oni keeps its own config and chunk types here so the rest of the codebase is
+//! not coupled directly to the external crate.
+
 use std::io::Read;
 
 use fastcdc::v2020::{self, StreamCDC};
@@ -12,6 +17,7 @@ pub struct Config {
 }
 
 impl Config {
+    /// Validate one FastCDC size triple before the rest of the code sees it.
     pub fn new(min_size: u32, avg_size: u32, max_size: u32) -> Result<Self, ChunkerError> {
         validate_bounds("min-size", min_size, v2020::MINIMUM_MIN, v2020::MINIMUM_MAX)?;
         validate_bounds("avg-size", avg_size, v2020::AVERAGE_MIN, v2020::AVERAGE_MAX)?;
@@ -57,10 +63,13 @@ impl Default for Config {
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct Chunk {
+    /// Byte offset of the chunk start in the original input stream.
     pub offset: u64,
+    /// Number of bytes in this chunk.
     pub length: usize,
 }
 
+/// Chunk an in-memory buffer.
 pub fn chunk_bytes(data: &[u8], config: Config) -> Vec<Chunk> {
     v2020::FastCDC::new(
         data,
@@ -75,6 +84,10 @@ pub fn chunk_bytes(data: &[u8], config: Config) -> Vec<Chunk> {
     .collect()
 }
 
+/// Chunk a streaming reader.
+///
+/// Keeping this alongside `chunk_bytes` lets future CDC code choose between
+/// in-memory and streaming paths without touching the external crate directly.
 pub fn chunk_reader(reader: impl Read, config: Config) -> Result<Vec<Chunk>, ChunkerError> {
     let mut chunks = Vec::new();
 
