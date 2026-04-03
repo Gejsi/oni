@@ -158,10 +158,11 @@ impl Manifest {
                 source,
             })?;
             let path = entry.path();
-            let metadata = fs::symlink_metadata(path).map_err(|source| ManifestError::Metadata {
-                path: path.to_path_buf(),
-                source,
-            })?;
+            let metadata =
+                fs::symlink_metadata(path).map_err(|source| ManifestError::Metadata {
+                    path: path.to_path_buf(),
+                    source,
+                })?;
 
             if !metadata.is_file() {
                 continue;
@@ -188,7 +189,8 @@ mod tests {
     #[cfg(unix)]
     use std::os::unix::fs::symlink;
     use std::path::PathBuf;
-    use std::time::{SystemTime, UNIX_EPOCH};
+
+    use crate::path::temp_path;
 
     use super::{Manifest, ManifestRoot};
 
@@ -346,13 +348,5 @@ mod tests {
             error,
             crate::error::ManifestError::MissingPath { .. }
         ));
-    }
-
-    fn temp_path(label: &str) -> PathBuf {
-        let unique = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_nanos();
-        std::env::temp_dir().join(format!("oni-{label}-{unique}"))
     }
 }
