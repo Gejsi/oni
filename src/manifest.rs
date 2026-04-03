@@ -66,13 +66,14 @@ impl ManifestEntry {
         let relative_path = if path == root {
             path.file_name()
                 .map(PathBuf::from)
-                .ok_or_else(|| ManifestError::RelativePath {
+                .ok_or_else(|| ManifestError::MissingFileName {
                     path: path.to_path_buf(),
                 })?
         } else {
             path.strip_prefix(root)
-                .map_err(|_| ManifestError::RelativePath {
+                .map_err(|source| ManifestError::RelativePath {
                     path: path.to_path_buf(),
+                    source,
                 })?
                 .to_path_buf()
         };
@@ -93,7 +94,7 @@ impl ManifestEntry {
 }
 
 /// Whether the scan root comes from a file or from a directory
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum ManifestRoot {
     File,
     Directory,
@@ -138,8 +139,9 @@ impl Manifest {
         }
 
         if root.is_file() {
-            let metadata = fs::metadata(root).map_err(|_| ManifestError::Metadata {
+            let metadata = fs::metadata(root).map_err(|source| ManifestError::Metadata {
                 path: root.to_path_buf(),
+                source,
             })?;
 
             return Ok(Self {
@@ -151,12 +153,14 @@ impl Manifest {
         let mut entries = Vec::new();
 
         for entry in WalkDir::new(root) {
-            let entry = entry.map_err(|_| ManifestError::Walk {
+            let entry = entry.map_err(|source| ManifestError::Walk {
                 root: root.to_path_buf(),
+                source,
             })?;
             let path = entry.path();
-            let metadata = entry.metadata().map_err(|_| ManifestError::Metadata {
+            let metadata = fs::symlink_metadata(path).map_err(|source| ManifestError::Metadata {
                 path: path.to_path_buf(),
+                source,
             })?;
 
             if !metadata.is_file() {

@@ -1,30 +1,15 @@
-use std::path::PathBuf;
+use clap::Parser;
 
-use clap::{Parser, Subcommand};
-
+use oni::cli::{Cli, Command, InternalSubcommand, RunArgs};
 use oni::error::OniError;
 use oni::manifest::Manifest;
-
-#[derive(Parser, Debug)]
-#[command(version, about = "oni, a file synchronization tool")]
-struct Cli {
-    #[command(subcommand)]
-    command: Command,
-}
-
-#[derive(Subcommand, Debug)]
-enum Command {
-    Manifest {
-        /// File or directory to scan
-        path: PathBuf,
-    },
-}
+use oni::session::{Preview, Request};
 
 fn main() -> Result<(), OniError> {
     let cli = Cli::parse();
 
     match cli.command {
-        Command::Manifest { path } => {
+        Some(Command::Manifest { path }) => {
             let manifest = Manifest::scan(&path)?;
 
             for entry in manifest.entries {
@@ -38,5 +23,56 @@ fn main() -> Result<(), OniError> {
 
             Ok(())
         }
+        Some(Command::Internal(command)) => match command.command {
+            InternalSubcommand::Serve(_) => {
+                Err(oni::error::SessionError::ServeNotImplemented.into())
+            }
+        },
+        None => run(cli.run),
+    }
+}
+
+fn run(args: RunArgs) -> Result<(), OniError> {
+    let options = args.options();
+    let source = args
+        .source
+        .as_deref()
+        .ok_or(oni::error::SessionError::MissingOperands)?;
+    let destination = args
+        .destination
+        .as_deref()
+        .ok_or(oni::error::SessionError::MissingOperands)?;
+    let request = Request::from_args(source, destination, options)?;
+    let preview = request.preview()?;
+
+    print_preview(&request, &preview);
+
+    Ok(())
+}
+
+fn print_preview(request: &Request, preview: &Preview) {
+    println!("mode\t{}", preview.mode);
+    println!("source\t{}", request.source);
+    println!("destination\t{}", request.destination);
+    println!("strategy\t{}", request.options.strategy);
+    println!("chunker\t{}", request.options.chunker);
+
+    if let Some(tag) = &request.options.benchmark_tag {
+        println!("benchmark-tag\t{tag}");
+    }
+
+    for operation in &preview.operations {
+        println!("{}\t{}", operation.kind, operation.path.display());
+    }
+
+    let summary = preview.summary();
+
+    if request.options.stats || request.options.verbose > 0 {
+        println!("summary\tcreate={}", summary.create);
+        println!("summary\tupdate={}", summary.update_total());
+        println!("summary\tupdate-data={}", summary.update_data);
+        println!("summary\tupdate-metadata={}", summary.update_metadata);
+        println!("summary\tdelete={}", summary.delete);
+        println!("summary\tskip={}", summary.skip);
     }
 }

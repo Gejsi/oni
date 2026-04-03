@@ -1,17 +1,24 @@
 use crate::error::PlanError;
-use crate::manifest::{Manifest, ManifestRoot};
+use crate::manifest::{Manifest, ManifestEntry, ManifestRoot};
 
-#[derive(Debug, PartialEq, Eq, Default)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
 pub struct PlanOptions {
     pub delete_extraneous: bool,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Operation {
     Create {
         source_index: usize,
     },
-    Update {
+    // The executor will need this split later: a metadata-only change can be
+    // applied without resending file contents, while a data change must choose
+    // a transfer strategy.
+    UpdateData {
+        source_index: usize,
+        destination_index: usize,
+    },
+    UpdateMetadata {
         source_index: usize,
         destination_index: usize,
     },
@@ -54,8 +61,24 @@ impl Plan {
                 | (ManifestRoot::Directory, ManifestRoot::File)
         ) {
             return Err(PlanError::RootKindMismatch {
-                source_root: source.root.clone(),
-                destination_root: destination.root.clone(),
+                source_root: source.root,
+                destination_root: destination.root,
+            });
+        }
+
+        if matches!(
+            (&source.root, &destination.root),
+            (ManifestRoot::File, ManifestRoot::File)
+        ) {
+            // File roots are planned as one logical item. The source may be
+            // `a.txt` and the destination `b.txt`, but that is still a single
+            // replace-or-skip decision rather than a merge by relative name.
+            let source_entry = &source.entries[0];
+            let destination_entry = &destination.entries[0];
+            let operation = classify_matched_entries(source_entry, destination_entry, 0, 0);
+
+            return Ok(Self {
+                operations: vec![operation],
             });
         }
 
@@ -81,19 +104,12 @@ impl Plan {
                     destination_index += 1;
                 }
                 std::cmp::Ordering::Equal => {
-                    if source_entry.metadata == destination_entry.metadata
-                        && source_entry.kind == destination_entry.kind
-                    {
-                        operations.push(Operation::Skip {
-                            source_index,
-                            destination_index,
-                        });
-                    } else {
-                        operations.push(Operation::Update {
-                            source_index,
-                            destination_index,
-                        });
-                    }
+                    operations.push(classify_matched_entries(
+                        source_entry,
+                        destination_entry,
+                        source_index,
+                        destination_index,
+                    ));
                     source_index += 1;
                     destination_index += 1;
                 }
@@ -113,6 +129,36 @@ impl Plan {
         }
 
         Ok(Self { operations })
+    }
+}
+
+fn classify_matched_entries(
+    source: &ManifestEntry,
+    destination: &ManifestEntry,
+    source_index: usize,
+    destination_index: usize,
+) -> Operation {
+    // A length or kind mismatch always means the file payload has to change.
+    if source.kind != destination.kind || source.metadata.len != destination.metadata.len {
+        return Operation::UpdateData {
+            source_index,
+            destination_index,
+        };
+    }
+
+    // Equal length does not prove equal contents. The planner intentionally
+    // stays cheap and metadata-based; the session layer can pay for `--checksum`
+    // verification when the user explicitly asks for it.
+    if source.metadata == destination.metadata {
+        Operation::Skip {
+            source_index,
+            destination_index,
+        }
+    } else {
+        Operation::UpdateMetadata {
+            source_index,
+            destination_index,
+        }
     }
 }
 
@@ -173,7 +219,39 @@ mod tests {
 
         assert_eq!(
             plan.operations,
-            vec![Operation::Update {
+            vec![Operation::UpdateData {
+                source_index: 0,
+                destination_index: 0,
+            }]
+        );
+    }
+
+    #[test]
+    fn plans_file_roots_even_when_the_leaf_names_differ() {
+        let source = file_manifest("source.txt", 4, 11);
+        let destination = file_manifest("destination.txt", 3, 10);
+
+        let plan = Plan::build(&source, Some(&destination), PlanOptions::default()).unwrap();
+
+        assert_eq!(
+            plan.operations,
+            vec![Operation::UpdateData {
+                source_index: 0,
+                destination_index: 0,
+            }]
+        );
+    }
+
+    #[test]
+    fn plans_metadata_updates_for_changed_file_roots() {
+        let source = file_manifest("todo.txt", 3, 11);
+        let destination = file_manifest("todo.txt", 3, 10);
+
+        let plan = Plan::build(&source, Some(&destination), PlanOptions::default()).unwrap();
+
+        assert_eq!(
+            plan.operations,
+            vec![Operation::UpdateMetadata {
                 source_index: 0,
                 destination_index: 0,
             }]
@@ -215,7 +293,7 @@ mod tests {
 
         assert_eq!(
             plan.operations,
-            vec![Operation::Update {
+            vec![Operation::UpdateMetadata {
                 source_index: 0,
                 destination_index: 0,
             }]
