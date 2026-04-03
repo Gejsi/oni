@@ -1,0 +1,239 @@
+use std::ffi::OsString;
+use std::fs::{self as std_fs, File, Metadata, OpenOptions};
+use std::io;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+use crate::error::SessionError;
+
+static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+/// Replace `destination` with the contents and basic metadata from `source`.
+///
+/// The write happens through a sibling temp file so a crash does not leave a
+/// truncated destination file behind.
+pub fn replace_file(source: &Path, destination: &Path) -> Result<(), SessionError> {
+    let parent = parent_directory(destination);
+    std_fs::create_dir_all(parent).map_err(|source_error| SessionError::ApplyIo {
+        operation: "create destination parent directory",
+        path: parent.to_path_buf(),
+        source: source_error,
+    })?;
+
+    let mut source_file = File::open(source).map_err(|source_error| SessionError::ApplyIo {
+        operation: "open source file",
+        path: source.to_path_buf(),
+        source: source_error,
+    })?;
+    let source_metadata = source_file
+        .metadata()
+        .map_err(|source_error| SessionError::ApplyIo {
+            operation: "read source metadata",
+            path: source.to_path_buf(),
+            source: source_error,
+        })?;
+
+    let mut pending = PendingFile::create(destination)?;
+    io::copy(&mut source_file, pending.file()).map_err(|source_error| SessionError::ApplyIo {
+        operation: "copy file data into temporary destination",
+        path: destination.to_path_buf(),
+        source: source_error,
+    })?;
+    apply_metadata(pending.file(), &source_metadata, destination)?;
+    pending.persist(destination)
+}
+
+/// Apply metadata-only changes to an existing file without rewriting contents.
+pub fn sync_metadata(source: &Path, destination: &Path) -> Result<(), SessionError> {
+    let source_metadata =
+        std_fs::metadata(source).map_err(|source_error| SessionError::ApplyIo {
+            operation: "read source metadata",
+            path: source.to_path_buf(),
+            source: source_error,
+        })?;
+    let destination_file =
+        File::options()
+            .read(true)
+            .open(destination)
+            .map_err(|source_error| SessionError::ApplyIo {
+                operation: "open destination file for metadata update",
+                path: destination.to_path_buf(),
+                source: source_error,
+            })?;
+
+    apply_metadata(&destination_file, &source_metadata, destination)?;
+    destination_file
+        .sync_all()
+        .map_err(|source_error| SessionError::ApplyIo {
+            operation: "sync destination file metadata",
+            path: destination.to_path_buf(),
+            source: source_error,
+        })?;
+
+    Ok(())
+}
+
+pub fn remove_file(path: &Path) -> Result<(), SessionError> {
+    std_fs::remove_file(path).map_err(|source_error| SessionError::ApplyIo {
+        operation: "remove destination file",
+        path: path.to_path_buf(),
+        source: source_error,
+    })?;
+    sync_parent_directory(path)
+}
+
+fn apply_metadata(
+    file: &File,
+    metadata: &Metadata,
+    destination: &Path,
+) -> Result<(), SessionError> {
+    file.set_permissions(metadata.permissions())
+        .map_err(|source_error| SessionError::ApplyIo {
+            operation: "set file permissions",
+            path: destination.to_path_buf(),
+            source: source_error,
+        })?;
+
+    if let Ok(modified) = metadata.modified() {
+        file.set_modified(modified)
+            .map_err(|source_error| SessionError::ApplyIo {
+                operation: "set file modified time",
+                path: destination.to_path_buf(),
+                source: source_error,
+            })?;
+    }
+
+    Ok(())
+}
+
+fn parent_directory(path: &Path) -> &Path {
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or(Path::new("."))
+}
+
+fn sync_parent_directory(path: &Path) -> Result<(), SessionError> {
+    #[cfg(unix)]
+    {
+        let parent = parent_directory(path);
+        let directory = File::open(parent).map_err(|source_error| SessionError::ApplyIo {
+            operation: "open parent directory for sync",
+            path: parent.to_path_buf(),
+            source: source_error,
+        })?;
+
+        directory
+            .sync_all()
+            .map_err(|source_error| SessionError::ApplyIo {
+                operation: "sync parent directory",
+                path: parent.to_path_buf(),
+                source: source_error,
+            })?;
+    }
+
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+    }
+
+    Ok(())
+}
+
+struct PendingFile {
+    path: PathBuf,
+    file: Option<File>,
+    persisted: bool,
+}
+
+impl PendingFile {
+    fn create(destination: &Path) -> Result<Self, SessionError> {
+        let parent = parent_directory(destination);
+        let file_name = destination
+            .file_name()
+            .map(OsString::from)
+            .unwrap_or_else(|| OsString::from("oni-target"));
+
+        for _ in 0..128 {
+            let unique = TEMP_FILE_COUNTER.fetch_add(1, Ordering::Relaxed);
+            let temp_name = format!(
+                ".{}.oni-tmp-{}-{}",
+                file_name.to_string_lossy(),
+                std::process::id(),
+                unique
+            );
+            let temp_path = parent.join(temp_name);
+
+            match OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&temp_path)
+            {
+                Ok(file) => {
+                    return Ok(Self {
+                        path: temp_path,
+                        file: Some(file),
+                        persisted: false,
+                    });
+                }
+                Err(source_error) if source_error.kind() == io::ErrorKind::AlreadyExists => {
+                    continue;
+                }
+                Err(source_error) => {
+                    return Err(SessionError::ApplyIo {
+                        operation: "create temporary destination file",
+                        path: destination.to_path_buf(),
+                        source: source_error,
+                    });
+                }
+            }
+        }
+
+        Err(SessionError::ApplyIo {
+            operation: "create temporary destination file",
+            path: destination.to_path_buf(),
+            source: io::Error::other("exhausted temporary file name attempts"),
+        })
+    }
+
+    fn file(&mut self) -> &mut File {
+        self.file
+            .as_mut()
+            .expect("pending temp file is always present")
+    }
+
+    fn persist(mut self, destination: &Path) -> Result<(), SessionError> {
+        let file = self
+            .file
+            .take()
+            .expect("pending temp file is always present");
+        file.sync_all()
+            .map_err(|source_error| SessionError::ApplyIo {
+                operation: "sync temporary destination file",
+                path: self.path.clone(),
+                source: source_error,
+            })?;
+        drop(file);
+
+        std_fs::rename(&self.path, destination).map_err(|source_error| SessionError::ApplyIo {
+            operation: "rename temporary file into place",
+            path: destination.to_path_buf(),
+            source: source_error,
+        })?;
+        self.persisted = true;
+        sync_parent_directory(destination)
+    }
+}
+
+impl Drop for PendingFile {
+    fn drop(&mut self) {
+        if self.persisted {
+            return;
+        }
+
+        if let Some(file) = self.file.take() {
+            drop(file);
+        }
+
+        let _ = std_fs::remove_file(&self.path);
+    }
+}

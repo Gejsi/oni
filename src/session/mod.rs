@@ -38,10 +38,8 @@ impl Request {
     }
 
     pub fn preview(&self) -> Result<Preview, SessionError> {
-        // The public CLI exists already, but real execution does not.
-        // Dry-run is the only honest top-level behavior for now.
         if !self.options.dry_run {
-            return Err(SessionError::ApplyNotImplemented);
+            return self.apply();
         }
 
         let operations = match (&self.source, &self.destination) {
@@ -49,6 +47,24 @@ impl Request {
             // assumptions do not spread into the future SSH-backed session.
             (Endpoint::Local(source), Endpoint::Local(destination)) => {
                 local::preview(source, destination, &self.options)?
+            }
+            _ => {
+                return Err(SessionError::UnsupportedMode {
+                    mode: self.mode().to_string(),
+                });
+            }
+        };
+
+        Ok(Preview {
+            mode: self.mode(),
+            operations,
+        })
+    }
+
+    pub fn apply(&self) -> Result<Preview, SessionError> {
+        let operations = match (&self.source, &self.destination) {
+            (Endpoint::Local(source), Endpoint::Local(destination)) => {
+                local::apply(source, destination, &self.options)?
             }
             _ => {
                 return Err(SessionError::UnsupportedMode {

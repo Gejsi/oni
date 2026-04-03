@@ -3,6 +3,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::error::SessionError;
+use crate::fs as fs_ops;
 use crate::manifest::{Manifest, ManifestRoot};
 use crate::path::LocalEndpoint;
 use crate::plan::{Operation, Plan, PlanOptions};
@@ -19,6 +20,56 @@ pub(super) fn preview(
     destination: &LocalEndpoint,
     options: &Options,
 ) -> Result<Vec<Change>, SessionError> {
+    let prepared = prepare(source, destination, options, options.checksum)?;
+
+    build_changes(
+        source,
+        destination,
+        &prepared.source_manifest,
+        prepared.destination_manifest.as_ref(),
+        &prepared.plan,
+    )
+}
+
+pub(super) fn apply(
+    source: &LocalEndpoint,
+    destination: &LocalEndpoint,
+    options: &Options,
+) -> Result<Vec<Change>, SessionError> {
+    // Real execution must be correct even when the user did not ask dry-run to
+    // pay for `--checksum`, so the local apply path always verifies matched
+    // same-size files before deciding they are metadata-only or skipped.
+    let prepared = prepare(source, destination, options, true)?;
+
+    execute_plan(
+        source,
+        destination,
+        &prepared.source_manifest,
+        prepared.destination_manifest.as_ref(),
+        &prepared.plan,
+    )?;
+
+    build_changes(
+        source,
+        destination,
+        &prepared.source_manifest,
+        prepared.destination_manifest.as_ref(),
+        &prepared.plan,
+    )
+}
+
+struct PreparedPlan {
+    source_manifest: Manifest,
+    destination_manifest: Option<Manifest>,
+    plan: Plan,
+}
+
+fn prepare(
+    source: &LocalEndpoint,
+    destination: &LocalEndpoint,
+    options: &Options,
+    verify_contents: bool,
+) -> Result<PreparedPlan, SessionError> {
     let source_manifest = Manifest::scan(&source.path)?;
     let destination_manifest = scan_destination_manifest(source, destination, &source_manifest)?;
     let mut plan = Plan::build(
@@ -35,16 +86,14 @@ pub(super) fn preview(
         &source_manifest,
         destination_manifest.as_ref(),
         &mut plan,
-        options.checksum,
+        verify_contents,
     )?;
 
-    build_changes(
-        source,
-        destination,
-        &source_manifest,
-        destination_manifest.as_ref(),
-        &plan,
-    )
+    Ok(PreparedPlan {
+        source_manifest,
+        destination_manifest,
+        plan,
+    })
 }
 
 fn scan_destination_manifest(
@@ -71,6 +120,67 @@ fn scan_destination_manifest(
             }
         }
     }
+}
+
+fn execute_plan(
+    source: &LocalEndpoint,
+    destination: &LocalEndpoint,
+    source_manifest: &Manifest,
+    destination_manifest: Option<&Manifest>,
+    plan: &Plan,
+) -> Result<(), SessionError> {
+    for operation in &plan.operations {
+        match *operation {
+            Operation::Create { source_index } => {
+                let (source_path, destination_path) =
+                    create_operation_paths(source, destination, source_manifest, source_index)?;
+                fs_ops::replace_file(&source_path, &destination_path)?;
+            }
+            Operation::UpdateData {
+                source_index,
+                destination_index,
+            } => {
+                let (source_path, destination_path) = matched_operation_paths(
+                    source,
+                    destination,
+                    source_manifest,
+                    destination_manifest.ok_or(SessionError::MissingDestinationManifest)?,
+                    source_index,
+                    destination_index,
+                )?;
+                fs_ops::replace_file(&source_path, &destination_path)?;
+            }
+            Operation::UpdateMetadata {
+                source_index,
+                destination_index,
+            } => {
+                let (source_path, destination_path) = matched_operation_paths(
+                    source,
+                    destination,
+                    source_manifest,
+                    destination_manifest.ok_or(SessionError::MissingDestinationManifest)?,
+                    source_index,
+                    destination_index,
+                )?;
+                fs_ops::sync_metadata(&source_path, &destination_path)?;
+            }
+            Operation::Delete { destination_index } => {
+                let destination_path = delete_operation_path(
+                    source,
+                    destination,
+                    destination_manifest.ok_or(SessionError::MissingDestinationManifest)?,
+                    destination_index,
+                )?;
+                fs_ops::remove_file(&destination_path)?;
+            }
+            Operation::Skip {
+                source_index: _,
+                destination_index: _,
+            } => {}
+        }
+    }
+
+    Ok(())
 }
 
 fn build_changes(
@@ -102,6 +212,27 @@ fn build_changes(
                 })
                 .collect())
         }
+    }
+}
+
+fn create_operation_paths(
+    source: &LocalEndpoint,
+    destination: &LocalEndpoint,
+    source_manifest: &Manifest,
+    source_index: usize,
+) -> Result<(PathBuf, PathBuf), SessionError> {
+    match source_manifest.root {
+        ManifestRoot::Directory => {
+            let relative_path = &source_manifest.entries[source_index].path;
+            Ok((
+                source.path.join(relative_path),
+                destination.path.join(relative_path),
+            ))
+        }
+        ManifestRoot::File => Ok((
+            source.path.clone(),
+            resolve_file_target(source, destination)?,
+        )),
     }
 }
 
@@ -236,6 +367,20 @@ fn matched_operation_paths(
     }
 }
 
+fn delete_operation_path(
+    source: &LocalEndpoint,
+    destination: &LocalEndpoint,
+    destination_manifest: &Manifest,
+    destination_index: usize,
+) -> Result<PathBuf, SessionError> {
+    match destination_manifest.root {
+        ManifestRoot::Directory => Ok(destination
+            .path
+            .join(&destination_manifest.entries[destination_index].path)),
+        ManifestRoot::File => resolve_file_target(source, destination),
+    }
+}
+
 fn files_match(source: &Path, destination: &Path) -> Result<bool, SessionError> {
     let mut source_file = File::open(source).map_err(|source_error| SessionError::ChecksumIo {
         path: source.to_path_buf(),
@@ -281,9 +426,10 @@ fn files_match(source: &Path, destination: &Path) -> Result<bool, SessionError> 
 #[cfg(test)]
 mod tests {
     use std::fs;
+    use std::fs::File;
     use std::path::PathBuf;
     use std::thread;
-    use std::time::Duration;
+    use std::time::{Duration, UNIX_EPOCH};
 
     use crate::path::temp_path;
     use crate::session::{Chunker, Options, Request, Strategy};
@@ -413,5 +559,136 @@ mod tests {
         assert_eq!(preview.operations[0].path, destination);
 
         fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn applies_single_file_create_and_preserves_contents() {
+        let root = temp_path("session-apply-create");
+        fs::create_dir_all(&root).unwrap();
+
+        let source = root.join("alpha.txt");
+        let destination = root.join("beta.txt");
+        fs::write(&source, b"oni").unwrap();
+
+        let request = Request::from_args(
+            &source.to_string_lossy(),
+            &destination.to_string_lossy(),
+            Options::default(),
+        )
+        .unwrap();
+
+        let applied = request.apply().unwrap();
+
+        assert_eq!(applied.operations.len(), 1);
+        assert_eq!(applied.operations[0].kind.to_string(), "create");
+        assert_eq!(applied.operations[0].path, destination);
+        assert_eq!(fs::read(&destination).unwrap(), b"oni");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn applies_equal_size_changed_files_even_without_checksum_flag() {
+        let root = temp_path("session-apply-same-size");
+        fs::create_dir_all(&root).unwrap();
+
+        let source = root.join("alpha.txt");
+        let destination = root.join("beta.txt");
+        fs::write(&source, b"aaa").unwrap();
+        fs::write(&destination, b"bbb").unwrap();
+
+        let request = Request::from_args(
+            &source.to_string_lossy(),
+            &destination.to_string_lossy(),
+            Options::default(),
+        )
+        .unwrap();
+
+        let applied = request.apply().unwrap();
+
+        assert_eq!(applied.operations.len(), 1);
+        assert_eq!(applied.operations[0].kind.to_string(), "update-data");
+        assert_eq!(fs::read(&destination).unwrap(), b"aaa");
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn applies_metadata_only_updates_without_rewriting_file_contents() {
+        let root = temp_path("session-apply-metadata");
+        fs::create_dir_all(&root).unwrap();
+
+        let source = root.join("alpha.txt");
+        let destination = root.join("beta.txt");
+        fs::write(&source, b"oni").unwrap();
+        fs::write(&destination, b"oni").unwrap();
+
+        let source_time = UNIX_EPOCH + Duration::from_secs(20_000);
+        let destination_time = UNIX_EPOCH + Duration::from_secs(10_000);
+
+        File::open(&source)
+            .unwrap()
+            .set_modified(source_time)
+            .unwrap();
+        File::open(&destination)
+            .unwrap()
+            .set_modified(destination_time)
+            .unwrap();
+
+        let request = Request::from_args(
+            &source.to_string_lossy(),
+            &destination.to_string_lossy(),
+            Options::default(),
+        )
+        .unwrap();
+
+        let applied = request.apply().unwrap();
+
+        assert_eq!(applied.operations.len(), 1);
+        assert_eq!(applied.operations[0].kind.to_string(), "update-metadata");
+        assert_eq!(fs::read(&destination).unwrap(), b"oni");
+
+        let destination_modified = fs::metadata(&destination).unwrap().modified().unwrap();
+        let delta = destination_modified
+            .duration_since(source_time)
+            .unwrap_or_else(|error| error.duration());
+        assert!(
+            delta <= Duration::from_secs(1),
+            "destination mtime drifted by {:?}",
+            delta
+        );
+
+        fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn applies_directory_deletes_when_requested() {
+        let source = temp_path("session-apply-delete-source");
+        let destination = temp_path("session-apply-delete-destination");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+
+        fs::write(source.join("keep.txt"), b"keep").unwrap();
+        fs::write(destination.join("keep.txt"), b"keep").unwrap();
+        fs::write(destination.join("remove.txt"), b"remove").unwrap();
+
+        let request = Request::from_args(
+            &source.to_string_lossy(),
+            &destination.to_string_lossy(),
+            Options {
+                delete_extraneous: true,
+                ..Options::default()
+            },
+        )
+        .unwrap();
+
+        let applied = request.apply().unwrap();
+
+        assert_eq!(applied.summary().delete, 1);
+        assert!(!destination.join("remove.txt").exists());
+        assert!(destination.join("keep.txt").exists());
+
+        fs::remove_dir_all(source).unwrap();
+        fs::remove_dir_all(destination).unwrap();
     }
 }

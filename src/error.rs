@@ -4,6 +4,7 @@ use std::path::{PathBuf, StripPrefixError};
 use thiserror::Error;
 
 use crate::manifest::ManifestRoot;
+use crate::protocol::{Capability, PeerRole, ProtocolVersion, VersionRange};
 
 #[derive(Debug, Error)]
 pub enum OniError {
@@ -13,6 +14,8 @@ pub enum OniError {
     Plan(#[from] PlanError),
     #[error(transparent)]
     Path(#[from] PathError),
+    #[error(transparent)]
+    Protocol(#[from] ProtocolError),
     #[error(transparent)]
     Session(#[from] SessionError),
 }
@@ -64,16 +67,41 @@ pub enum PathError {
     MissingRemoteUser { spec: String },
 }
 
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum ProtocolError {
+    #[error("invalid protocol version range: {min}..={max}")]
+    InvalidVersionRange {
+        min: ProtocolVersion,
+        max: ProtocolVersion,
+    },
+    #[error("invalid protocol limit {field}: {value}")]
+    InvalidLimit { field: &'static str, value: u32 },
+    #[error("incompatible peer roles for one session: local={local}, remote={remote}")]
+    IncompatibleRoles { local: PeerRole, remote: PeerRole },
+    #[error("no shared protocol version: local supports {local}, remote supports {remote}")]
+    NoSharedVersion {
+        local: VersionRange,
+        remote: VersionRange,
+    },
+    #[error("missing required negotiated capability: {capability}")]
+    MissingRequiredCapability { capability: Capability },
+}
+
 #[derive(Debug, Error)]
 pub enum SessionError {
     #[error(transparent)]
     Manifest(#[from] ManifestError),
     #[error(transparent)]
     Plan(#[from] PlanError),
-    #[error("execution is not implemented yet; use --dry-run to inspect the plan")]
-    ApplyNotImplemented,
     #[error("failed to access file during checksum preview: {path}")]
     ChecksumIo {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("failed to {operation}: {path}")]
+    ApplyIo {
+        operation: &'static str,
         path: PathBuf,
         #[source]
         source: io::Error,

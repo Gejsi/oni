@@ -43,9 +43,14 @@ fn run(args: RunArgs) -> Result<(), OniError> {
         .as_deref()
         .ok_or(oni::error::SessionError::MissingOperands)?;
     let request = Request::from_args(source, destination, options)?;
-    let preview = request.preview()?;
 
-    print_preview(&request, &preview);
+    if request.options.dry_run {
+        let preview = request.preview()?;
+        print_preview(&request, &preview);
+    } else {
+        let applied = request.apply()?;
+        print_apply(&request, &applied);
+    }
 
     Ok(())
 }
@@ -68,6 +73,29 @@ fn print_preview(request: &Request, preview: &Preview) {
     let summary = preview.summary();
 
     if request.options.stats || request.options.verbose > 0 {
+        println!("summary\tcreate={}", summary.create);
+        println!("summary\tupdate={}", summary.update_total());
+        println!("summary\tupdate-data={}", summary.update_data);
+        println!("summary\tupdate-metadata={}", summary.update_metadata);
+        println!("summary\tdelete={}", summary.delete);
+        println!("summary\tskip={}", summary.skip);
+    }
+}
+
+fn print_apply(request: &Request, applied: &Preview) {
+    if request.options.verbose > 0 {
+        println!("mode\t{}", applied.mode);
+        println!("source\t{}", request.source);
+        println!("destination\t{}", request.destination);
+
+        for operation in &applied.operations {
+            println!("applied\t{}\t{}", operation.kind, operation.path.display());
+        }
+    }
+
+    if request.options.stats || request.options.verbose > 0 {
+        let summary = applied.summary();
+
         println!("summary\tcreate={}", summary.create);
         println!("summary\tupdate={}", summary.update_total());
         println!("summary\tupdate-data={}", summary.update_data);
