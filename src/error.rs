@@ -21,6 +21,8 @@ pub enum OniError {
     #[error(transparent)]
     Strategy(#[from] StrategyError),
     #[error(transparent)]
+    Chunker(#[from] ChunkerError),
+    #[error(transparent)]
     Session(#[from] SessionError),
 }
 
@@ -145,6 +147,29 @@ pub enum StrategyError {
     },
     #[error("fixed-size delta recipe references a missing basis block: {block_index}")]
     InvalidBlockReference { block_index: usize },
+}
+
+#[derive(Debug, Error)]
+pub enum ChunkerError {
+    #[error("invalid FastCDC {field}: {value} is outside the supported range {min}..={max}")]
+    InvalidBound {
+        field: &'static str,
+        value: u32,
+        min: u32,
+        max: u32,
+    },
+    #[error("invalid FastCDC chunk-size ordering: min={min_size}, avg={avg_size}, max={max_size}")]
+    InvalidOrdering {
+        min_size: u32,
+        avg_size: u32,
+        max_size: u32,
+    },
+    #[error("failed to {operation}")]
+    FastCdcIo {
+        operation: &'static str,
+        #[source]
+        source: fastcdc::v2020::Error,
+    },
 }
 
 #[derive(Debug, Error)]
