@@ -13,6 +13,12 @@
 //! 5. `apply` replays the recipe against the basis file to reconstruct the
 //!    desired output
 //!
+//! ASCII view:
+//!
+//!   basis file --fixed blocks----------> weak+strong signatures
+//!   source file --rolling byte scan---> copy/literal recipe
+//!   recipe + basis file --------------> rebuilt output
+//!
 //! This file owns only the algorithmic core:
 //! - no transport
 //! - no filesystem metadata

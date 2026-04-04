@@ -144,7 +144,7 @@ pub enum TransportError {
 
 #[derive(Debug, Error)]
 pub enum StrategyError {
-    #[error("failed to {operation} during fixed-size delta processing")]
+    #[error("failed to {operation} during transfer-strategy processing")]
     Io {
         operation: &'static str,
         #[source]
@@ -152,6 +152,12 @@ pub enum StrategyError {
     },
     #[error("fixed-size delta recipe references a missing basis block: {block_index}")]
     InvalidBlockReference { block_index: usize },
+    #[error(
+        "CDC delta recipe references a missing basis span at offset {offset} with length {len}"
+    )]
+    InvalidBasisSpan { offset: u64, len: usize },
+    #[error(transparent)]
+    Chunker(#[from] ChunkerError),
 }
 
 #[derive(Debug, Error)]
@@ -185,6 +191,8 @@ pub enum SessionError {
     Plan(#[from] PlanError),
     #[error(transparent)]
     Strategy(#[from] StrategyError),
+    #[error(transparent)]
+    Chunker(#[from] ChunkerError),
     #[error("failed to access file during checksum preview: {path}")]
     ChecksumIo {
         path: PathBuf,
@@ -200,6 +208,8 @@ pub enum SessionError {
     },
     #[error("transfer strategy is not implemented yet: {strategy}")]
     UnsupportedStrategy { strategy: String },
+    #[error("chunker {chunker} is not implemented for strategy {strategy}")]
+    UnsupportedChunker { strategy: String, chunker: String },
     #[error("mode is not implemented yet: {mode}")]
     UnsupportedMode { mode: String },
     #[error("cannot preview delete operations without a destination manifest")]

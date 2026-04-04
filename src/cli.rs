@@ -104,7 +104,7 @@ pub enum StrategyArg {
     Whole,
     /// Use the fixed-size rsync-style delta path.
     Fixed,
-    /// Reserve the CDC path for future helper-backed execution.
+    /// Use the content-defined chunking delta path.
     Cdc,
 }
 
@@ -121,7 +121,7 @@ impl From<StrategyArg> for Strategy {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 pub enum ChunkerArg {
-    /// Placeholder for non-CDC fixed blocking.
+    /// Reserved for future non-FastCDC chunking experiments.
     Fixed,
     #[value(name = "fastcdc")]
     FastCdc,
