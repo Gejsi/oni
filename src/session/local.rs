@@ -484,16 +484,12 @@ fn apply_fastcdc_delta_update(
 ) -> Result<(), SessionError> {
     // Current local FastCDC flow:
     //
-    //   destination --chunk pass--> boundaries
-    //               --hash pass----> basis signatures
-    //   source      --chunk pass--> boundaries
-    //               --hash pass----> recipe
-    //   recipe + destination basis -> temp file -> atomic rename
+    //   destination --StreamCDC--> chunk bytes --hash--> basis signatures
+    //   source      --StreamCDC--> chunk bytes --hash--> recipe
+    //   recipe + destination basis ----------------------> temp file -> rename
     //
-    // The implementation is intentionally simple and bounded, but for local
-    // same-disk benchmarks it is doing materially more CPU and more file passes
-    // than `whole`, so it should not be expected to beat local whole-file rsync
-    // yet.
+    // This removes the extra "collect all boundaries, rewind, read again" pass,
+    // but the local CDC path still buffers the final recipe before apply.
     let config = cdc::FastCdcConfig::default();
 
     let signatures_start = Instant::now();

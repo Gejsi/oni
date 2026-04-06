@@ -19,9 +19,9 @@ pub struct Config {
 impl Config {
     /// Validate one FastCDC size triple before the rest of the code sees it.
     pub fn new(min_size: u32, avg_size: u32, max_size: u32) -> Result<Self, ChunkerError> {
-        validate_bounds("min-size", min_size, v2020::MINIMUM_MIN, v2020::MINIMUM_MAX)?;
-        validate_bounds("avg-size", avg_size, v2020::AVERAGE_MIN, v2020::AVERAGE_MAX)?;
-        validate_bounds("max-size", max_size, v2020::MAXIMUM_MIN, v2020::MAXIMUM_MAX)?;
+        Self::validate_bounds("min-size", min_size, v2020::MINIMUM_MIN, v2020::MINIMUM_MAX)?;
+        Self::validate_bounds("avg-size", avg_size, v2020::AVERAGE_MIN, v2020::AVERAGE_MAX)?;
+        Self::validate_bounds("max-size", max_size, v2020::MAXIMUM_MIN, v2020::MAXIMUM_MAX)?;
 
         if !(min_size < avg_size && avg_size < max_size) {
             return Err(ChunkerError::InvalidOrdering {
@@ -48,6 +48,24 @@ impl Config {
 
     pub fn max_size(self) -> u32 {
         self.max_size
+    }
+
+    fn validate_bounds(
+        field: &'static str,
+        value: u32,
+        min: u32,
+        max: u32,
+    ) -> Result<(), ChunkerError> {
+        if value < min || value > max {
+            return Err(ChunkerError::InvalidBound {
+                field,
+                value,
+                min,
+                max,
+            });
+        }
+
+        Ok(())
     }
 }
 
@@ -85,9 +103,6 @@ pub fn chunk_bytes(data: &[u8], config: Config) -> Vec<Chunk> {
 }
 
 /// Chunk a streaming reader.
-///
-/// Keeping this alongside `chunk_bytes` lets future CDC code choose between
-/// in-memory and streaming paths without touching the external crate directly.
 pub fn chunk_reader(reader: impl Read, config: Config) -> Result<Vec<Chunk>, ChunkerError> {
     let mut chunks = Vec::new();
 
@@ -108,24 +123,6 @@ pub fn chunk_reader(reader: impl Read, config: Config) -> Result<Vec<Chunk>, Chu
     }
 
     Ok(chunks)
-}
-
-fn validate_bounds(
-    field: &'static str,
-    value: u32,
-    min: u32,
-    max: u32,
-) -> Result<(), ChunkerError> {
-    if value < min || value > max {
-        return Err(ChunkerError::InvalidBound {
-            field,
-            value,
-            min,
-            max,
-        });
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -177,7 +174,9 @@ mod tests {
             .collect::<Vec<_>>();
         let config = Config::default();
 
+        // in-memory chunker
         let from_bytes = chunk_bytes(&data, config);
+        // streaming chunker
         let from_reader = chunk_reader(Cursor::new(&data), config).unwrap();
 
         assert_eq!(from_reader, from_bytes);

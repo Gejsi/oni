@@ -2,6 +2,7 @@
 name = "oni"
 version = "1.0.0"
 edition = "2021"
+default-run = "oni"
 
 [dependencies]
 blake3 = "1.5.0"

@@ -8,27 +8,24 @@
 //! - replay the recipe against the basis file to reconstruct the source
 //!
 //! The implementation deliberately stays simple for the first production
-//! baseline. It uses two passes per file:
-//! - one pass to find chunk boundaries
-//! - one pass to read and hash the chunk contents
-//!
-//! That keeps memory bounded to one chunk at a time while avoiding whole-file
-//! buffering in the executor path.
+//! baseline. It now uses the crate's `StreamCDC` iterator directly, so each file
+//! is chunked and hashed in one forward pass with bounded memory.
 //!
 //! ASCII view:
 //!
-//!   basis file --FastCDC boundaries--> chunk spans --hash--> signature table
-//!   source file --FastCDC boundaries-> chunk spans --hash--> copy/literal recipe
-//!   recipe + basis file ----------------------------------> rebuilt output
+//!   basis file --StreamCDC--> chunk bytes --hash--> signature table
+//!   source file --StreamCDC--> chunk bytes --hash--> copy/literal recipe
+//!   recipe + basis file -------------------------------> rebuilt output
 //!
 //! The important tradeoff is visible in the diagram: this baseline is simple
-//! and bounded, but it is multi-pass. On local same-disk benchmarks that extra
-//! work can dominate any bytes saved by the recipe.
+//! and bounded, but it still materializes the final recipe before apply. That
+//! keeps the code easy to reason about for now, but it is still not the final
+//! streaming token pipeline Oni wants over SSH stdio.
 
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 
-use crate::chunker::fastcdc::{self, Chunk};
+use fastcdc::v2020::{Error as FastCdcError, StreamCDC};
 use crate::error::StrategyError;
 
 const READ_BUFFER_SIZE: usize = 8 * 1024;
@@ -58,33 +55,28 @@ pub struct Recipe {
     pub chunks: Vec<RecipeChunk>,
 }
 
-pub fn signatures_fastcdc(
-    reader: &mut (impl Read + Seek),
-    config: FastCdcConfig,
-) -> Result<SignatureTable, StrategyError> {
-    // Pass 1 finds chunk boundaries. Pass 2 rewinds and hashes each chunk.
-    let boundaries = fastcdc_boundaries(reader, config)?;
-    rewind(reader, "rewind basis file after FastCDC scan")?;
+pub fn signatures_fastcdc(reader: &mut impl Read, config: FastCdcConfig) -> Result<SignatureTable, StrategyError> {
+    let mut chunks = Vec::new();
+    let mut by_hash = HashMap::new();
 
-    let mut chunks = Vec::with_capacity(boundaries.len());
-    let mut by_hash = HashMap::with_capacity(boundaries.len());
-    let mut buffer = Vec::new();
-
-    for chunk in boundaries {
-        read_chunk_bytes(
-            reader,
-            &mut buffer,
-            chunk.length,
-            "read FastCDC basis chunk",
-        )?;
-        let strong = strong_checksum(&buffer);
+    for result in StreamCDC::new(
+        &mut *reader,
+        config.min_size(),
+        config.avg_size(),
+        config.max_size(),
+    ) {
+        let chunk = result.map_err(|source| StrategyError::from(fastcdc_stream_error(
+            "read streaming FastCDC basis chunk",
+            source,
+        )))?;
+        let strong = strong_checksum(&chunk.data);
         by_hash
             .entry(strong)
             .or_insert_with(Vec::new)
             .push(chunks.len());
         chunks.push(ChunkSignature {
             offset: chunk.offset,
-            len: chunk.length,
+            len: chunk.length as usize,
         });
     }
 
@@ -92,36 +84,31 @@ pub fn signatures_fastcdc(
 }
 
 pub fn delta_fastcdc(
-    reader: &mut (impl Read + Seek),
+    reader: &mut impl Read,
     signatures: &SignatureTable,
     config: FastCdcConfig,
 ) -> Result<Recipe, StrategyError> {
-    // The source side mirrors `signatures_fastcdc`: discover chunk boundaries
-    // first, then rewind and classify each chunk as copy-or-literal.
-    let boundaries = fastcdc_boundaries(reader, config)?;
-    rewind(reader, "rewind source file after FastCDC scan")?;
+    let mut recipe = Recipe { chunks: Vec::new() };
 
-    let mut recipe = Recipe {
-        chunks: Vec::with_capacity(boundaries.len()),
-    };
-    let mut buffer = Vec::new();
+    for result in StreamCDC::new(
+        &mut *reader,
+        config.min_size(),
+        config.avg_size(),
+        config.max_size(),
+    ) {
+        let chunk = result.map_err(|source| StrategyError::from(fastcdc_stream_error(
+            "read streaming FastCDC source chunk",
+            source,
+        )))?;
+        let strong = strong_checksum(&chunk.data);
 
-    for chunk in boundaries {
-        read_chunk_bytes(
-            reader,
-            &mut buffer,
-            chunk.length,
-            "read FastCDC source chunk",
-        )?;
-        let strong = strong_checksum(&buffer);
-
-        if let Some(signature) = find_match(signatures, strong, chunk.length) {
+        if let Some(signature) = find_match(signatures, strong, chunk.length as usize) {
             recipe.chunks.push(RecipeChunk::Copy {
                 offset: signature.offset,
                 len: signature.len,
             });
         } else {
-            push_literal(&mut recipe, &buffer);
+            push_literal(&mut recipe, &chunk.data);
         }
     }
 
@@ -185,30 +172,11 @@ pub fn apply(
     Ok(())
 }
 
-fn fastcdc_boundaries(
-    reader: &mut (impl Read + Seek),
-    config: FastCdcConfig,
-) -> Result<Vec<Chunk>, StrategyError> {
-    Ok(fastcdc::chunk_reader(&mut *reader, config)?)
-}
-
-fn rewind(reader: &mut impl Seek, operation: &'static str) -> Result<(), StrategyError> {
-    reader
-        .seek(SeekFrom::Start(0))
-        .map_err(|source| StrategyError::Io { operation, source })?;
-    Ok(())
-}
-
-fn read_chunk_bytes(
-    reader: &mut impl Read,
-    buffer: &mut Vec<u8>,
-    len: usize,
+fn fastcdc_stream_error(
     operation: &'static str,
-) -> Result<(), StrategyError> {
-    buffer.resize(len, 0);
-    reader
-        .read_exact(buffer.as_mut_slice())
-        .map_err(|source| StrategyError::Io { operation, source })
+    source: FastCdcError,
+) -> crate::error::ChunkerError {
+    crate::error::ChunkerError::FastCdcIo { operation, source }
 }
 
 fn strong_checksum(bytes: &[u8]) -> [u8; 32] {

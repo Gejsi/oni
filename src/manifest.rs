@@ -175,7 +175,7 @@ impl Manifest {
 
             // Early `v2` only plans regular files. Directories are implicit in
             // the relative paths, and symlink/device handling will be added as
-            // an explicit manifest feature later instead of being guessed here.
+            // an explicit manifest feature later.
             if !metadata.is_file() {
                 continue;
             }
@@ -183,9 +183,7 @@ impl Manifest {
             entries.push(ManifestEntry::build_file_entry(path, root, &metadata)?);
         }
 
-        // The walker does not promise a stable order
-        // Sorting keeps the inventory deterministic
-        // For instance, `letters/a.txt` will always come before `letters/b.txt`
+        // The walker does not promise a stable order so sorting keeps the inventory deterministic
         entries.sort_by(|left, right| left.path.cmp(&right.path));
 
         Ok(Self {

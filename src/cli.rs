@@ -16,8 +16,6 @@ use crate::session::{Chunker, Options, Strategy};
     subcommand_negates_reqs = true
 )]
 pub struct Cli {
-    // File transfer is the default behavior, like rsync. Subcommands are only
-    // for internal plumbing and debugging helpers.
     #[command(subcommand)]
     pub command: Option<Command>,
 

@@ -1,18 +1,19 @@
 //! Merge-style planning between source and destination manifests.
 //!
 //! The planner stays cheap and deterministic. It compares metadata only and
-//! leaves expensive content verification to the session layer.
+//! leaves expensive content verification to the session layer when the user requests
+//! `--checksum` or when real execution must double-check equal-size files.
 
 use crate::error::PlanError;
 use crate::manifest::{Manifest, ManifestEntry, ManifestRoot};
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Default)]
 pub struct PlanOptions {
     /// When false, destination-only paths are ignored instead of planned as deletes.
     pub delete_extraneous: bool,
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum Operation {
     /// Destination path does not exist yet.
     Create { source_index: usize },
@@ -37,17 +38,67 @@ pub enum Operation {
     },
 }
 
-#[derive(Debug, PartialEq, Eq)]
+impl Operation {
+    fn classify_matched_entries(
+        source: &ManifestEntry,
+        destination: &ManifestEntry,
+        source_index: usize,
+        destination_index: usize,
+    ) -> Self {
+        // Once relative paths match, only file kind/size/metadata decide which
+        // operation we need. Payload verification stays outside the pure planner.
+        // A length or kind mismatch always means the file payload has to change.
+        if source.kind != destination.kind || source.metadata.len != destination.metadata.len {
+            return Self::UpdateData {
+                source_index,
+                destination_index,
+            };
+        }
+
+        // Equal length does not prove equal contents. The planner intentionally
+        // stays cheap and metadata-based; the session layer can pay for `--checksum`
+        // verification when the user explicitly asks for it.
+        if source.metadata == destination.metadata {
+            Self::Skip {
+                source_index,
+                destination_index,
+            }
+        } else {
+            Self::UpdateMetadata {
+                source_index,
+                destination_index,
+            }
+        }
+    }
+}
+
+/// Deterministic plan done by walking the sorted manifests.
+///
+/// Current shape:
+/// - materialize full source and destination manifests
+/// - build a full `Vec<Operation>`
+/// - let later stages verify, execute, and report in additional passes
+///
+/// This is good scaffolding because it keeps planning pure, deterministic, and
+/// easy to test.
+///
+/// It is not the final performance shape.
+///
+/// Long-term direction:
+/// - keep `manifest` and `plan` as separate logical phases
+/// - stop requiring the planner to materialize the whole `Vec<Operation>` up
+///   front before the executor can do anything useful
+/// - evolve toward a merge iterator or consumer-style API such as
+///   `plan_with(..., |operation| ...)`
+///
+/// That would preserve the current simple merge logic while removing one
+/// buffering stage and fitting remote/helper-backed execution better.
+#[derive(Debug)]
 pub struct Plan {
     pub operations: Vec<Operation>,
 }
 
 impl Plan {
-    /// Build a deterministic sync plan by walking the sorted manifests once.
-    ///
-    /// The planner intentionally does not do expensive content verification.
-    /// That cost belongs in the session layer when the user requests
-    /// `--checksum` or when real execution must double-check equal-size files.
     pub fn build(
         source: &Manifest,
         destination: Option<&Manifest>,
@@ -65,32 +116,30 @@ impl Plan {
             });
         };
 
-        // Reject `file -> directory` and `directory -> file`
-        if matches!(
-            (&source.root, &destination.root),
+        match (source.root, destination.root) {
+            // Reject `file -> directory` and `directory -> file`
+            // because those roots cannot be merged against each other.
             (ManifestRoot::File, ManifestRoot::Directory)
-                | (ManifestRoot::Directory, ManifestRoot::File)
-        ) {
-            return Err(PlanError::RootKindMismatch {
-                source_root: source.root,
-                destination_root: destination.root,
-            });
-        }
+            | (ManifestRoot::Directory, ManifestRoot::File) => {
+                return Err(PlanError::RootKindMismatch {
+                    source_root: source.root,
+                    destination_root: destination.root,
+                });
+            }
+            (ManifestRoot::File, ManifestRoot::File) => {
+                // File roots are planned as one logical item. The source may be
+                // `a.txt` and the destination `b.txt`, but that is still a single
+                // replace-or-skip decision.
+                let source_entry = &source.entries[0];
+                let destination_entry = &destination.entries[0];
+                let operation =
+                    Operation::classify_matched_entries(source_entry, destination_entry, 0, 0);
 
-        if matches!(
-            (&source.root, &destination.root),
-            (ManifestRoot::File, ManifestRoot::File)
-        ) {
-            // File roots are planned as one logical item. The source may be
-            // `a.txt` and the destination `b.txt`, but that is still a single
-            // replace-or-skip decision rather than a merge by relative name.
-            let source_entry = &source.entries[0];
-            let destination_entry = &destination.entries[0];
-            let operation = classify_matched_entries(source_entry, destination_entry, 0, 0);
-
-            return Ok(Self {
-                operations: vec![operation],
-            });
+                return Ok(Self {
+                    operations: vec![operation],
+                });
+            }
+            (ManifestRoot::Directory, ManifestRoot::Directory) => {}
         }
 
         let mut operations = Vec::with_capacity(source.entries.len() + destination.entries.len());
@@ -115,7 +164,7 @@ impl Plan {
                     destination_index += 1;
                 }
                 std::cmp::Ordering::Equal => {
-                    operations.push(classify_matched_entries(
+                    operations.push(Operation::classify_matched_entries(
                         source_entry,
                         destination_entry,
                         source_index,
@@ -140,38 +189,6 @@ impl Plan {
         }
 
         Ok(Self { operations })
-    }
-}
-
-fn classify_matched_entries(
-    source: &ManifestEntry,
-    destination: &ManifestEntry,
-    source_index: usize,
-    destination_index: usize,
-) -> Operation {
-    // Once relative paths match, only file kind/size/metadata decide which
-    // operation we need. Payload verification stays outside the pure planner.
-    // A length or kind mismatch always means the file payload has to change.
-    if source.kind != destination.kind || source.metadata.len != destination.metadata.len {
-        return Operation::UpdateData {
-            source_index,
-            destination_index,
-        };
-    }
-
-    // Equal length does not prove equal contents. The planner intentionally
-    // stays cheap and metadata-based; the session layer can pay for `--checksum`
-    // verification when the user explicitly asks for it.
-    if source.metadata == destination.metadata {
-        Operation::Skip {
-            source_index,
-            destination_index,
-        }
-    } else {
-        Operation::UpdateMetadata {
-            source_index,
-            destination_index,
-        }
     }
 }
 
