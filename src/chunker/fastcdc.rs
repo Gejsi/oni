@@ -1,7 +1,21 @@
-//! Thin wrapper around the third-party FastCDC implementation.
+//! Oni-owned FastCDC boundary.
 //!
-//! Oni keeps its own config and chunk types here so the rest of the codebase is
-//! not coupled directly to the external crate.
+//! The current implementation still delegates to the third-party crate, but the
+//! rest of Oni consumes callback-based chunk streams from this module instead
+//! of depending on the crate's `Vec`- or iterator-shaped APIs directly.
+//!
+//! Important distinction:
+//! - at Oni's API boundary, `chunk_slice(...)` and `chunk_read(...)` are
+//!   streaming because they deliver one chunk at a time to a callback instead
+//!   of materializing a `Vec<Chunk>`
+//! - inside `chunk_read(...)`, we still use the upstream `StreamCDC`
+//!   adapter, which allocates an owned `Vec<u8>` for each yielded chunk
+//!
+//! That means the boundary is now correct for the rest of Oni, but the
+//! implementation is not yet the final no-per-chunk-allocation hot path.
+//! Vendoring the FastCDC core only becomes justified once profiling or the next
+//! CDC refactor needs borrowed slices from one reusable buffer or direct
+//! token-emission while chunking.
 
 use std::io::Read;
 
@@ -81,56 +95,110 @@ impl Default for Config {
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub struct Chunk {
+    /// Rolling FastCDC hash at the end of this chunk.
+    pub hash: u64,
     /// Byte offset of the chunk start in the original input stream.
     pub offset: u64,
     /// Number of bytes in this chunk.
     pub length: usize,
 }
 
-/// Chunk an in-memory buffer.
-pub fn chunk_bytes(data: &[u8], config: Config) -> Vec<Chunk> {
-    v2020::FastCDC::new(
+/// Chunk an in-memory slice.
+///
+/// This is the natural fit for mmap-backed local file fast paths because the
+/// caller already owns one contiguous readable view of the input bytes.
+pub fn chunk_slice<E, F>(data: &[u8], config: Config, mut on_chunk: F) -> Result<(), E>
+where
+    E: From<ChunkerError>,
+    F: FnMut(Chunk, &[u8]) -> Result<(), E>,
+{
+    for chunk in v2020::FastCDC::new(
         data,
         config.min_size(),
         config.avg_size(),
         config.max_size(),
-    )
-    .map(|chunk| Chunk {
-        offset: chunk.offset as u64,
-        length: chunk.length,
-    })
-    .collect()
+    ) {
+        let start = chunk.offset;
+        let end = start + chunk.length;
+        on_chunk(
+            Chunk {
+                hash: chunk.hash,
+                offset: chunk.offset as u64,
+                length: chunk.length,
+            },
+            &data[start..end],
+        )?;
+    }
+
+    Ok(())
 }
 
-/// Chunk a streaming reader.
-pub fn chunk_reader(reader: impl Read, config: Config) -> Result<Vec<Chunk>, ChunkerError> {
-    let mut chunks = Vec::new();
-
+/// Chunk a generic streaming reader.
+///
+/// This is the path for SSH stdio, pipes, sockets, and any other source that
+/// cannot expose a stable full slice.
+///
+/// This is streaming at Oni's API boundary, but not yet the final internal hot
+/// path because the current upstream adapter still hands us owned chunk
+/// buffers.
+pub fn chunk_read<R, E, F>(reader: &mut R, config: Config, mut on_chunk: F) -> Result<(), E>
+where
+    R: Read,
+    E: From<ChunkerError>,
+    F: FnMut(Chunk, &[u8]) -> Result<(), E>,
+{
     for result in StreamCDC::new(
-        reader,
+        &mut *reader,
         config.min_size(),
         config.avg_size(),
         config.max_size(),
     ) {
-        let chunk = result.map_err(|source| ChunkerError::FastCdcIo {
-            operation: "read chunk boundaries from streaming FastCDC source",
-            source,
+        let chunk = result.map_err(|source| {
+            E::from(ChunkerError::FastCdcIo {
+                operation: "read streaming FastCDC chunk",
+                source,
+            })
         })?;
-        chunks.push(Chunk {
-            offset: chunk.offset,
-            length: chunk.length,
-        });
+        on_chunk(
+            Chunk {
+                hash: chunk.hash,
+                offset: chunk.offset,
+                length: chunk.length,
+            },
+            &chunk.data,
+        )?;
     }
 
-    Ok(chunks)
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
 
-    use super::{chunk_bytes, chunk_reader, Config};
+    use super::{chunk_read, chunk_slice, Chunk, Config};
     use crate::error::ChunkerError;
+
+    fn collect_slice(data: &[u8], config: Config) -> Vec<Chunk> {
+        let mut chunks = Vec::new();
+        chunk_slice(data, config, |chunk, _| {
+            chunks.push(chunk);
+            Ok::<_, ChunkerError>(())
+        })
+        .unwrap();
+        chunks
+    }
+
+    fn collect_reader(data: &[u8], config: Config) -> Vec<Chunk> {
+        let mut chunks = Vec::new();
+        let mut reader = Cursor::new(data);
+        chunk_read(&mut reader, config, |chunk, _| {
+            chunks.push(chunk);
+            Ok::<_, ChunkerError>(())
+        })
+        .unwrap();
+        chunks
+    }
 
     #[test]
     fn rejects_invalid_config_ordering() {
@@ -153,7 +221,7 @@ mod tests {
     #[test]
     fn chunks_cover_the_input_without_gaps() {
         let data = vec![b'a'; 256 * 1024];
-        let chunks = chunk_bytes(&data, Config::default());
+        let chunks = collect_slice(&data, Config::default());
 
         assert!(!chunks.is_empty());
         assert_eq!(chunks.first().unwrap().offset, 0);
@@ -174,17 +242,33 @@ mod tests {
             .collect::<Vec<_>>();
         let config = Config::default();
 
-        // in-memory chunker
-        let from_bytes = chunk_bytes(&data, config);
-        // streaming chunker
-        let from_reader = chunk_reader(Cursor::new(&data), config).unwrap();
+        let from_slice = collect_slice(&data, config);
+        let from_reader = collect_reader(&data, config);
 
-        assert_eq!(from_reader, from_bytes);
+        assert_eq!(from_reader, from_slice);
+    }
+
+    #[test]
+    fn callback_receives_chunk_bytes_in_order() {
+        let data = (0..80_000)
+            .map(|index| (index % 241) as u8)
+            .collect::<Vec<_>>();
+        let config = Config::default();
+        let mut rebuilt = Vec::new();
+
+        chunk_slice(&data, config, |chunk, bytes| {
+            assert_eq!(bytes.len(), chunk.length);
+            rebuilt.extend_from_slice(bytes);
+            Ok::<_, ChunkerError>(())
+        })
+        .unwrap();
+
+        assert_eq!(rebuilt, data);
     }
 
     #[test]
     fn empty_inputs_produce_no_chunks() {
-        let chunks = chunk_bytes(&[], Config::default());
+        let chunks = collect_slice(&[], Config::default());
 
         assert!(chunks.is_empty());
     }

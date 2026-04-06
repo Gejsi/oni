@@ -1,20 +1,20 @@
 //! Content-defined chunking delta primitives.
 //!
 //! This baseline keeps the CDC path transport-agnostic:
-//! - chunk an existing basis file with FastCDC
+//! - chunk an existing basis file through Oni's FastCDC boundary
 //! - hash each basis chunk strongly
 //! - chunk the source file with the same FastCDC parameters
 //! - reuse matching basis chunks and emit literals for the rest
 //! - replay the recipe against the basis file to reconstruct the source
 //!
 //! The implementation deliberately stays simple for the first production
-//! baseline. It now uses the crate's `StreamCDC` iterator directly, so each file
-//! is chunked and hashed in one forward pass with bounded memory.
+//! baseline. Each file is chunked and hashed in one forward pass with bounded
+//! memory, but the final copy/literal recipe is still buffered before apply.
 //!
 //! ASCII view:
 //!
-//!   basis file --StreamCDC--> chunk bytes --hash--> signature table
-//!   source file --StreamCDC--> chunk bytes --hash--> copy/literal recipe
+//!   basis file --chunk_read--> chunk bytes --hash--> signature table
+//!   source file --chunk_read--> chunk bytes --hash--> copy/literal recipe
 //!   recipe + basis file -------------------------------> rebuilt output
 //!
 //! The important tradeoff is visible in the diagram: this baseline is simple
@@ -25,7 +25,7 @@
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 
-use fastcdc::v2020::{Error as FastCdcError, StreamCDC};
+use crate::chunker::fastcdc;
 use crate::error::StrategyError;
 
 const READ_BUFFER_SIZE: usize = 8 * 1024;
@@ -55,30 +55,25 @@ pub struct Recipe {
     pub chunks: Vec<RecipeChunk>,
 }
 
-pub fn signatures_fastcdc(reader: &mut impl Read, config: FastCdcConfig) -> Result<SignatureTable, StrategyError> {
+pub fn signatures_fastcdc(
+    reader: &mut impl Read,
+    config: FastCdcConfig,
+) -> Result<SignatureTable, StrategyError> {
     let mut chunks = Vec::new();
     let mut by_hash = HashMap::new();
 
-    for result in StreamCDC::new(
-        &mut *reader,
-        config.min_size(),
-        config.avg_size(),
-        config.max_size(),
-    ) {
-        let chunk = result.map_err(|source| StrategyError::from(fastcdc_stream_error(
-            "read streaming FastCDC basis chunk",
-            source,
-        )))?;
-        let strong = strong_checksum(&chunk.data);
+    fastcdc::chunk_read(reader, config, |chunk, bytes| {
+        let strong = strong_checksum(bytes);
         by_hash
             .entry(strong)
             .or_insert_with(Vec::new)
             .push(chunks.len());
         chunks.push(ChunkSignature {
             offset: chunk.offset,
-            len: chunk.length as usize,
+            len: chunk.length,
         });
-    }
+        Ok::<_, StrategyError>(())
+    })?;
 
     Ok(SignatureTable { chunks, by_hash })
 }
@@ -90,27 +85,19 @@ pub fn delta_fastcdc(
 ) -> Result<Recipe, StrategyError> {
     let mut recipe = Recipe { chunks: Vec::new() };
 
-    for result in StreamCDC::new(
-        &mut *reader,
-        config.min_size(),
-        config.avg_size(),
-        config.max_size(),
-    ) {
-        let chunk = result.map_err(|source| StrategyError::from(fastcdc_stream_error(
-            "read streaming FastCDC source chunk",
-            source,
-        )))?;
-        let strong = strong_checksum(&chunk.data);
+    fastcdc::chunk_read(reader, config, |chunk, bytes| {
+        let strong = strong_checksum(bytes);
 
-        if let Some(signature) = find_match(signatures, strong, chunk.length as usize) {
+        if let Some(signature) = find_match(signatures, strong, chunk.length) {
             recipe.chunks.push(RecipeChunk::Copy {
                 offset: signature.offset,
                 len: signature.len,
             });
         } else {
-            push_literal(&mut recipe, &chunk.data);
+            push_literal(&mut recipe, bytes);
         }
-    }
+        Ok::<_, StrategyError>(())
+    })?;
 
     Ok(recipe)
 }
@@ -170,13 +157,6 @@ pub fn apply(
     }
 
     Ok(())
-}
-
-fn fastcdc_stream_error(
-    operation: &'static str,
-    source: FastCdcError,
-) -> crate::error::ChunkerError {
-    crate::error::ChunkerError::FastCdcIo { operation, source }
 }
 
 fn strong_checksum(bytes: &[u8]) -> [u8; 32] {

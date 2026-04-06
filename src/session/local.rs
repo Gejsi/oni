@@ -484,12 +484,12 @@ fn apply_fastcdc_delta_update(
 ) -> Result<(), SessionError> {
     // Current local FastCDC flow:
     //
-    //   destination --StreamCDC--> chunk bytes --hash--> basis signatures
-    //   source      --StreamCDC--> chunk bytes --hash--> recipe
+    //   destination --chunk_read--> chunk bytes --hash--> basis signatures
+    //   source      --chunk_read--> chunk bytes --hash--> recipe
     //   recipe + destination basis ----------------------> temp file -> rename
     //
-    // This removes the extra "collect all boundaries, rewind, read again" pass,
-    // but the local CDC path still buffers the final recipe before apply.
+    // The chunker boundary is now Oni-owned and callback-based, but the local
+    // CDC path still buffers the final recipe before apply.
     let config = cdc::FastCdcConfig::default();
 
     let signatures_start = Instant::now();
