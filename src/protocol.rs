@@ -145,10 +145,8 @@ impl fmt::Display for ImplementationInfo {
 #[repr(u16)]
 pub enum Capability {
     WholeFileTransfer = 0x0001,
-    FixedDeltaTransfer,
     CdcDeltaTransfer,
-    FixedChunker = 0x0100,
-    FastCdcChunker,
+    FastCdcChunker = 0x0100,
     SeqCdcChunker,
     Symlink = 0x0300,
     Xattr,
@@ -166,11 +164,9 @@ impl Capability {
     fn from_id(id: u16) -> Result<Self, ProtocolError> {
         match id {
             0x0001 => Ok(Self::WholeFileTransfer),
-            0x0002 => Ok(Self::FixedDeltaTransfer),
-            0x0003 => Ok(Self::CdcDeltaTransfer),
-            0x0100 => Ok(Self::FixedChunker),
-            0x0101 => Ok(Self::FastCdcChunker),
-            0x0102 => Ok(Self::SeqCdcChunker),
+            0x0002 => Ok(Self::CdcDeltaTransfer),
+            0x0100 => Ok(Self::FastCdcChunker),
+            0x0101 => Ok(Self::SeqCdcChunker),
             0x0300 => Ok(Self::Symlink),
             0x0301 => Ok(Self::Xattr),
             0x0302 => Ok(Self::Acl),
@@ -186,9 +182,7 @@ impl fmt::Display for Capability {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::WholeFileTransfer => f.write_str("whole-file-transfer"),
-            Self::FixedDeltaTransfer => f.write_str("fixed-delta-transfer"),
             Self::CdcDeltaTransfer => f.write_str("cdc-delta-transfer"),
-            Self::FixedChunker => f.write_str("fixed-chunker"),
             Self::FastCdcChunker => f.write_str("fastcdc-chunker"),
             Self::SeqCdcChunker => f.write_str("seqcdc-chunker"),
             Self::Symlink => f.write_str("symlink"),
@@ -265,8 +259,7 @@ impl fmt::Display for CapabilitySet {
 #[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 #[repr(u16)]
 pub enum ChunkerId {
-    Fixed = 1,
-    FastCdc,
+    FastCdc = 1,
     SeqCdc,
 }
 
@@ -279,7 +272,6 @@ impl ChunkerId {
 impl fmt::Display for ChunkerId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Fixed => f.write_str("fixed"),
             Self::FastCdc => f.write_str("fastcdc"),
             Self::SeqCdc => f.write_str("seqcdc"),
         }
@@ -724,7 +716,7 @@ mod tests {
             VersionRange::new(ProtocolVersion::new(2), ProtocolVersion::new(4)).unwrap(),
             CapabilitySet::from([
                 Capability::WholeFileTransfer,
-                Capability::FixedDeltaTransfer,
+                Capability::CdcDeltaTransfer,
                 Capability::FastCdcChunker,
             ]),
             Limits::new(4 * 1024 * 1024, 8 * 1024 * 1024).unwrap(),
@@ -823,8 +815,8 @@ mod tests {
     #[test]
     fn keeps_stable_numeric_ids_for_protocol_enums() {
         assert_eq!(Capability::WholeFileTransfer.id(), 0x0001);
-        assert_eq!(Capability::FastCdcChunker.id(), 0x0101);
-        assert_eq!(ChunkerId::SeqCdc.id(), 3);
+        assert_eq!(Capability::FastCdcChunker.id(), 0x0100);
+        assert_eq!(ChunkerId::SeqCdc.id(), 2);
         assert_eq!(OperationKind::DeleteDirectory.id(), 5);
     }
 

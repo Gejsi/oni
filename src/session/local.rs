@@ -1,7 +1,8 @@
 //! Local-only session backend for the current `v2` implementation.
 //!
 //! The file stays intentionally small:
-//! - prepare manifests and a plan
+//! - prepare manifests
+//! - stream planned operations
 //! - execute local filesystem changes
 //! - translate operations into user-facing preview output
 //!
@@ -13,7 +14,7 @@
 //!   scan source manifest -------------------+
 //!       |                                  |
 //!       v                                  v
-//!   resolve/scan destination manifest   build metadata-only plan
+//!   resolve/scan destination manifest   stream metadata-only plan
 //!       |                                  |
 //!       +--------------+-------------------+
 //!                      |
@@ -21,23 +22,19 @@
 //!        verify equal-size matches when needed
 //!                      |
 //!                      v
-//!              execute file operations
-//!                      |
-//!                      v
-//!               build user-facing changes
+//!          consume each operation immediately
+//!            as preview output or real apply
 
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
-use std::time::{Duration, Instant};
 
 use crate::error::SessionError;
 use crate::fs as fs_ops;
 use crate::manifest::{Manifest, ManifestRoot};
 use crate::path::LocalEndpoint;
-use crate::plan::{Operation, Plan, PlanOptions};
-use crate::strategy::{cdc, fixed};
+use crate::plan::{Operation, PlanOptions, for_each_operation};
+use crate::strategy::cdc;
 
 use super::{Change, ChangeKind, Options};
 
@@ -51,14 +48,17 @@ pub(super) fn preview(
     destination: &LocalEndpoint,
     options: &Options,
 ) -> Result<Vec<Change>, SessionError> {
-    let prepared = prepare(source, destination, options, options.checksum)?;
-
+    let prepared = prepare(source, destination)?;
+    let plan_options = PlanOptions {
+        delete_extraneous: options.delete_extraneous,
+    };
     build_changes(
         source,
         destination,
         &prepared.source_manifest,
         prepared.destination_manifest.as_ref(),
-        &prepared.plan,
+        options.checksum,
+        plan_options,
     )
 }
 
@@ -70,30 +70,34 @@ pub(super) fn apply(
     // Real execution must be correct even when the user did not ask dry-run to
     // pay for `--checksum`, so the local apply path always verifies matched
     // same-size files before deciding they are metadata-only or skipped.
-    let prepared = prepare(source, destination, options, true)?;
+    let prepared = prepare(source, destination)?;
+    let plan_options = PlanOptions {
+        delete_extraneous: options.delete_extraneous,
+    };
+    let changes = build_changes(
+        source,
+        destination,
+        &prepared.source_manifest,
+        prepared.destination_manifest.as_ref(),
+        true,
+        plan_options,
+    )?;
 
     execute_plan(
         source,
         destination,
         &prepared.source_manifest,
         prepared.destination_manifest.as_ref(),
-        &prepared.plan,
+        plan_options,
         options,
     )?;
 
-    build_changes(
-        source,
-        destination,
-        &prepared.source_manifest,
-        prepared.destination_manifest.as_ref(),
-        &prepared.plan,
-    )
+    Ok(changes)
 }
 
 struct PreparedPlan {
     source_manifest: Manifest,
     destination_manifest: Option<Manifest>,
-    plan: Plan,
 }
 
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
@@ -101,121 +105,22 @@ struct VerificationStats {
     compared_files: usize,
     promoted_to_data: usize,
     compared_bytes: u64,
-    elapsed: Duration,
 }
 
-static LOCAL_PROFILE_ENABLED: OnceLock<bool> = OnceLock::new();
-
-fn profile_enabled() -> bool {
-    *LOCAL_PROFILE_ENABLED.get_or_init(|| {
-        std::env::var("ONI_PROFILE_LOCAL")
-            .map(|value| !value.is_empty() && value != "0")
-            .unwrap_or(false)
-    })
-}
-
-fn profile_event(event: &str, duration: Duration, fields: &[(&str, String)]) {
-    if !profile_enabled() {
-        return;
-    }
-
-    let mut line = format!(
-        "profile-local\tevent={event}\tseconds={:.6}",
-        duration.as_secs_f64()
-    );
-
-    for (key, value) in fields {
-        line.push('\t');
-        line.push_str(key);
-        line.push('=');
-        line.push_str(value);
-    }
-
-    eprintln!("{line}");
-}
-
-fn prepare(
-    source: &LocalEndpoint,
-    destination: &LocalEndpoint,
-    options: &Options,
-    verify_contents: bool,
-) -> Result<PreparedPlan, SessionError> {
-    // The local backend always follows the same sequence:
-    //
-    //   metadata scan -> metadata plan -> optional byte verification
+fn prepare(source: &LocalEndpoint, destination: &LocalEndpoint) -> Result<PreparedPlan, SessionError> {
+    // The local backend always starts from the same metadata snapshot:
     //
     // 1. scan source
     // 2. scan/resolve destination
-    // 3. build a cheap metadata plan
-    // 4. optionally upgrade equal-size matches after content verification
-    let scan_source_start = Instant::now();
+    //
+    // Planning is now streamed later at the point of preview/execution instead
+    // of being buffered here as a second owned `Vec<Operation>`.
     let source_manifest = Manifest::scan(&source.path)?;
-    profile_event(
-        "prepare.scan-source",
-        scan_source_start.elapsed(),
-        &[
-            ("path", source.path.display().to_string()),
-            ("entries", source_manifest.entries.len().to_string()),
-            ("root", source_manifest.root.to_string()),
-        ],
-    );
-
-    let scan_destination_start = Instant::now();
     let destination_manifest = scan_destination_manifest(source, destination, &source_manifest)?;
-    profile_event(
-        "prepare.scan-destination",
-        scan_destination_start.elapsed(),
-        &[
-            ("path", destination.path.display().to_string()),
-            ("exists", destination_manifest.is_some().to_string()),
-        ],
-    );
-
-    let plan_start = Instant::now();
-    let mut plan = Plan::build(
-        &source_manifest,
-        destination_manifest.as_ref(),
-        PlanOptions {
-            delete_extraneous: options.delete_extraneous,
-        },
-    )?;
-    profile_event(
-        "prepare.plan-build",
-        plan_start.elapsed(),
-        &[("operations", plan.operations.len().to_string())],
-    );
-
-    let verification_stats = verify_matched_operations(
-        source,
-        destination,
-        &source_manifest,
-        destination_manifest.as_ref(),
-        &mut plan,
-        verify_contents,
-    )?;
-    profile_event(
-        "prepare.verify-matched",
-        verification_stats.elapsed,
-        &[
-            (
-                "compared-files",
-                verification_stats.compared_files.to_string(),
-            ),
-            (
-                "compared-bytes",
-                verification_stats.compared_bytes.to_string(),
-            ),
-            (
-                "promoted-to-update-data",
-                verification_stats.promoted_to_data.to_string(),
-            ),
-        ],
-    );
 
     Ok(PreparedPlan {
         source_manifest,
         destination_manifest,
-        plan,
     })
 }
 
@@ -250,100 +155,101 @@ fn execute_plan(
     destination: &LocalEndpoint,
     source_manifest: &Manifest,
     destination_manifest: Option<&Manifest>,
-    plan: &Plan,
+    plan_options: PlanOptions,
     options: &Options,
 ) -> Result<(), SessionError> {
-    // The local executor keeps one simple rule: planned file operations run in
-    // order, and each individual file change is crash-safe because `fs.rs`
-    // always writes through a sibling temp file before rename.
-    let execute_start = Instant::now();
+    // The local executor keeps one simple rule: consume planned operations in
+    // order, and make each file change crash-safe via `fs.rs`.
+    let mut execution_error: Option<SessionError> = None;
 
-    for operation in &plan.operations {
-        match *operation {
-            Operation::Create { source_index } => {
-                let operation_start = Instant::now();
-                let (source_path, destination_path) =
-                    create_operation_paths(source, destination, source_manifest, source_index)?;
-                fs_ops::replace_file(&source_path, &destination_path)?;
-                profile_event(
-                    "execute.create",
-                    operation_start.elapsed(),
-                    &[("path", destination_path.display().to_string())],
-                );
+    for_each_verified_operation(
+        source,
+        destination,
+        source_manifest,
+        destination_manifest,
+        true,
+        plan_options,
+        |operation| {
+            if execution_error.is_some() {
+                return;
             }
-            Operation::UpdateData {
-                source_index,
-                destination_index,
-            } => {
-                let operation_start = Instant::now();
-                let (source_path, destination_path) = matched_operation_paths(
-                    source,
-                    destination,
-                    source_manifest,
-                    destination_manifest.ok_or(SessionError::MissingDestinationManifest)?,
-                    source_index,
-                    destination_index,
-                )?;
-                apply_data_update(&source_path, &destination_path, options)?;
-                profile_event(
-                    "execute.update-data",
-                    operation_start.elapsed(),
-                    &[
-                        ("path", destination_path.display().to_string()),
-                        ("strategy", options.strategy.to_string()),
-                    ],
-                );
+
+            if let Err(error) = execute_operation(
+                source,
+                destination,
+                source_manifest,
+                destination_manifest,
+                operation,
+                options,
+            ) {
+                execution_error = Some(error);
             }
-            Operation::UpdateMetadata {
-                source_index,
-                destination_index,
-            } => {
-                let operation_start = Instant::now();
-                let (source_path, destination_path) = matched_operation_paths(
-                    source,
-                    destination,
-                    source_manifest,
-                    destination_manifest.ok_or(SessionError::MissingDestinationManifest)?,
-                    source_index,
-                    destination_index,
-                )?;
-                fs_ops::sync_metadata(&source_path, &destination_path)?;
-                profile_event(
-                    "execute.update-metadata",
-                    operation_start.elapsed(),
-                    &[("path", destination_path.display().to_string())],
-                );
-            }
-            Operation::Delete { destination_index } => {
-                let operation_start = Instant::now();
-                let destination_path = delete_operation_path(
-                    source,
-                    destination,
-                    destination_manifest.ok_or(SessionError::MissingDestinationManifest)?,
-                    destination_index,
-                )?;
-                fs_ops::remove_file(&destination_path)?;
-                if source_manifest.root == ManifestRoot::Directory {
-                    fs_ops::prune_empty_parent_directories(&destination_path, &destination.path)?;
-                }
-                profile_event(
-                    "execute.delete",
-                    operation_start.elapsed(),
-                    &[("path", destination_path.display().to_string())],
-                );
-            }
-            Operation::Skip {
-                source_index: _,
-                destination_index: _,
-            } => {}
-        }
+        },
+    )?;
+
+    if let Some(error) = execution_error {
+        Err(error)
+    } else {
+        Ok(())
     }
+}
 
-    profile_event(
-        "execute.plan-total",
-        execute_start.elapsed(),
-        &[("operations", plan.operations.len().to_string())],
-    );
+fn execute_operation(
+    source: &LocalEndpoint,
+    destination: &LocalEndpoint,
+    source_manifest: &Manifest,
+    destination_manifest: Option<&Manifest>,
+    operation: Operation,
+    options: &Options,
+) -> Result<(), SessionError> {
+    match operation {
+        Operation::Create { source_index } => {
+            let (source_path, destination_path) =
+                create_operation_paths(source, destination, source_manifest, source_index)?;
+            fs_ops::replace_file(&source_path, &destination_path)?;
+        }
+        Operation::UpdateData {
+            source_index,
+            destination_index,
+        } => {
+            let (source_path, destination_path) = matched_operation_paths(
+                source,
+                destination,
+                source_manifest,
+                destination_manifest.ok_or(SessionError::MissingDestinationManifest)?,
+                source_index,
+                destination_index,
+            )?;
+            apply_data_update(&source_path, &destination_path, options)?;
+        }
+        Operation::UpdateMetadata {
+            source_index,
+            destination_index,
+        } => {
+            let (source_path, destination_path) = matched_operation_paths(
+                source,
+                destination,
+                source_manifest,
+                destination_manifest.ok_or(SessionError::MissingDestinationManifest)?,
+                source_index,
+                destination_index,
+            )?;
+            fs_ops::sync_metadata(&source_path, &destination_path)?;
+        }
+        Operation::Delete { destination_index } => {
+            let destination_path = delete_operation_path(
+                source,
+                destination,
+                destination_manifest.ok_or(SessionError::MissingDestinationManifest)?,
+                destination_index,
+            )?;
+            fs_ops::remove_file(&destination_path)?;
+            if source_manifest.root == ManifestRoot::Directory {
+                fs_ops::prune_empty_parent_directories(&destination_path, &destination.path)?;
+            }
+        }
+        Operation::Skip { .. } => {}
+    }
 
     Ok(())
 }
@@ -359,109 +265,15 @@ fn apply_data_update(
     // `Auto` is intentionally conservative today:
     //
     //   Auto -> Whole
-    //        -> Fixed/Cdc only when the user asks explicitly
+    //        -> Cdc only when the user asks explicitly
     //
     // The real heuristic selector belongs here later.
     match options.strategy {
-        super::Strategy::Fixed => apply_fixed_delta_update(source_path, destination_path),
         super::Strategy::Auto | super::Strategy::Whole => {
             fs_ops::replace_file(source_path, destination_path)
         }
         super::Strategy::Cdc => apply_cdc_delta_update(source_path, destination_path, options),
     }
-}
-
-fn apply_fixed_delta_update(
-    source_path: &Path,
-    destination_path: &Path,
-) -> Result<(), SessionError> {
-    // The destination file is both:
-    // - the basis used to compute signatures and copy references
-    // - the path that will be atomically replaced once the recipe is applied
-    //
-    // Local fixed-delta flow:
-    //
-    //   destination --signatures--> basis table
-    //   source      --rolling scan-> recipe
-    //   recipe + destination basis -> temp file -> atomic rename
-    //
-    // This means local delta currently pays extra passes that whole-file copy
-    // does not pay: signature scan, source delta scan, and basis rereads during
-    // recipe apply.
-    let source_len = std::fs::metadata(source_path)
-        .map_err(|source| SessionError::ApplyIo {
-            operation: "read source metadata for fixed delta",
-            path: source_path.to_path_buf(),
-            source,
-        })?
-        .len();
-    let destination_len = std::fs::metadata(destination_path)
-        .map_err(|source| SessionError::ApplyIo {
-            operation: "read destination metadata for fixed delta",
-            path: destination_path.to_path_buf(),
-            source,
-        })?
-        .len();
-    let block_size = fixed::choose_block_size(source_len, destination_len);
-
-    let signatures_start = Instant::now();
-    let mut basis_signature_file =
-        File::open(destination_path).map_err(|source| SessionError::ApplyIo {
-            operation: "open destination basis file for fixed delta",
-            path: destination_path.to_path_buf(),
-            source,
-        })?;
-    let signatures = fixed::signatures(&mut basis_signature_file, block_size)?;
-    profile_event(
-        "fixed.signatures",
-        signatures_start.elapsed(),
-        &[
-            ("path", destination_path.display().to_string()),
-            ("block-size", block_size.to_string()),
-            ("basis-bytes", destination_len.to_string()),
-            ("blocks", signatures.blocks().len().to_string()),
-        ],
-    );
-
-    let recipe_start = Instant::now();
-    let mut source_file = File::open(source_path).map_err(|source| SessionError::ApplyIo {
-        operation: "open source file for fixed delta",
-        path: source_path.to_path_buf(),
-        source,
-    })?;
-    let recipe = fixed::delta(&mut source_file, &signatures)?;
-    profile_event(
-        "fixed.recipe",
-        recipe_start.elapsed(),
-        &[
-            ("path", source_path.display().to_string()),
-            ("source-bytes", source_len.to_string()),
-            ("chunks", recipe.chunks.len().to_string()),
-        ],
-    );
-
-    let apply_start = Instant::now();
-    fs_ops::replace_with_writer(source_path, destination_path, |writer| {
-        let mut basis_apply_file =
-            File::open(destination_path).map_err(|source| SessionError::ApplyIo {
-                operation: "reopen destination basis file for fixed delta apply",
-                path: destination_path.to_path_buf(),
-                source,
-            })?;
-
-        fixed::apply(&recipe, &mut basis_apply_file, writer)?;
-        Ok(())
-    })?;
-    profile_event(
-        "fixed.apply",
-        apply_start.elapsed(),
-        &[
-            ("path", destination_path.display().to_string()),
-            ("chunks", recipe.chunks.len().to_string()),
-        ],
-    );
-
-    Ok(())
 }
 
 fn apply_cdc_delta_update(
@@ -471,7 +283,7 @@ fn apply_cdc_delta_update(
 ) -> Result<(), SessionError> {
     match options.chunker {
         super::Chunker::FastCdc => apply_fastcdc_delta_update(source_path, destination_path),
-        super::Chunker::Fixed | super::Chunker::SeqCdc => Err(SessionError::UnsupportedChunker {
+        super::Chunker::SeqCdc => Err(SessionError::UnsupportedChunker {
             strategy: options.strategy.to_string(),
             chunker: options.chunker.to_string(),
         }),
@@ -485,14 +297,14 @@ fn apply_fastcdc_delta_update(
     // Current local FastCDC flow:
     //
     //   destination --chunk_read--> chunk bytes --hash--> basis signatures
-    //   source      --chunk_read--> chunk bytes --hash--> recipe
-    //   recipe + destination basis ----------------------> temp file -> rename
+    //   source      --chunk_read--> chunk bytes --match--> reference/literal sink
+    //   sink + destination basis ------------------------> temp file -> rename
     //
-    // The chunker boundary is now Oni-owned and callback-based, but the local
-    // CDC path still buffers the final recipe before apply.
+    // The important simplification here is that the source pass now streams
+    // directly into the temp-file writer. Only the basis-signature table stays
+    // buffered for the file.
     let config = cdc::FastCdcConfig::default();
 
-    let signatures_start = Instant::now();
     let mut basis_signature_file =
         File::open(destination_path).map_err(|source| SessionError::ApplyIo {
             operation: "open destination basis file for FastCDC delta",
@@ -500,29 +312,12 @@ fn apply_fastcdc_delta_update(
             source,
         })?;
     let signatures = cdc::signatures_fastcdc(&mut basis_signature_file, config)?;
-    profile_event(
-        "cdc.signatures",
-        signatures_start.elapsed(),
-        &[("path", destination_path.display().to_string())],
-    );
 
-    let recipe_start = Instant::now();
     let mut source_file = File::open(source_path).map_err(|source| SessionError::ApplyIo {
         operation: "open source file for FastCDC delta",
         path: source_path.to_path_buf(),
         source,
     })?;
-    let recipe = cdc::delta_fastcdc(&mut source_file, &signatures, config)?;
-    profile_event(
-        "cdc.recipe",
-        recipe_start.elapsed(),
-        &[
-            ("path", source_path.display().to_string()),
-            ("chunks", recipe.chunks.len().to_string()),
-        ],
-    );
-
-    let apply_start = Instant::now();
     fs_ops::replace_with_writer(source_path, destination_path, |writer| {
         let mut basis_apply_file =
             File::open(destination_path).map_err(|source| SessionError::ApplyIo {
@@ -531,17 +326,15 @@ fn apply_fastcdc_delta_update(
                 source,
             })?;
 
-        cdc::apply(&recipe, &mut basis_apply_file, writer)?;
+        cdc::apply_fastcdc(
+            &mut source_file,
+            &signatures,
+            config,
+            &mut basis_apply_file,
+            writer,
+        )?;
         Ok(())
     })?;
-    profile_event(
-        "cdc.apply",
-        apply_start.elapsed(),
-        &[
-            ("path", destination_path.display().to_string()),
-            ("chunks", recipe.chunks.len().to_string()),
-        ],
-    );
 
     Ok(())
 }
@@ -551,33 +344,55 @@ fn build_changes(
     destination: &LocalEndpoint,
     source_manifest: &Manifest,
     destination_manifest: Option<&Manifest>,
-    plan: &Plan,
+    verify_contents: bool,
+    plan_options: PlanOptions,
 ) -> Result<Vec<Change>, SessionError> {
-    // Preview output uses logical destination paths, not internal manifest
+    // Preview/apply output uses logical destination paths, not internal manifest
     // indices, so the CLI can print one stable path per operation.
+    let mut changes = Vec::new();
+
     match source_manifest.root {
-        ManifestRoot::Directory => plan
-            .operations
-            .iter()
-            .map(|operation| {
-                Ok(Change {
-                    kind: ChangeKind::from(operation),
-                    path: directory_change_path(source_manifest, destination_manifest, operation)?,
-                })
-            })
-            .collect(),
+        ManifestRoot::Directory => {
+            for_each_verified_operation(
+                source,
+                destination,
+                source_manifest,
+                destination_manifest,
+                verify_contents,
+                plan_options,
+                |operation| {
+                    changes.push(Change {
+                        kind: ChangeKind::from(&operation),
+                        path: directory_change_path(
+                            source_manifest,
+                            destination_manifest,
+                            &operation,
+                        )
+                        .expect("directory change path should be derivable"),
+                    });
+                },
+            )?;
+        }
         ManifestRoot::File => {
             let target_path = resolve_file_target(source, destination)?;
-            Ok(plan
-                .operations
-                .iter()
-                .map(|operation| Change {
-                    kind: ChangeKind::from(operation),
-                    path: target_path.clone(),
-                })
-                .collect())
+            for_each_verified_operation(
+                source,
+                destination,
+                source_manifest,
+                destination_manifest,
+                verify_contents,
+                plan_options,
+                |operation| {
+                    changes.push(Change {
+                        kind: ChangeKind::from(&operation),
+                        path: target_path.clone(),
+                    });
+                },
+            )?;
         }
     }
+
+    Ok(changes)
 }
 
 fn create_operation_paths(
@@ -648,22 +463,16 @@ fn resolve_file_target(
     Ok(destination.path.clone())
 }
 
-fn verify_matched_operations(
+fn for_each_verified_operation(
     source: &LocalEndpoint,
     destination: &LocalEndpoint,
     source_manifest: &Manifest,
     destination_manifest: Option<&Manifest>,
-    plan: &mut Plan,
     verify_contents: bool,
+    plan_options: PlanOptions,
+    mut on_operation: impl FnMut(Operation),
 ) -> Result<VerificationStats, SessionError> {
-    if !verify_contents {
-        return Ok(VerificationStats::default());
-    }
-
-    let Some(destination_manifest) = destination_manifest else {
-        return Ok(VerificationStats::default());
-    };
-
+    let mut callback_error = None;
     let mut stats = VerificationStats::default();
 
     // Equal-size matches take this refinement path:
@@ -683,70 +492,87 @@ fn verify_matched_operations(
     // The planner stays pure and metadata-based. `--checksum` is intentionally
     // a session-level opt-in because it performs real I/O and should not be
     // the planner's default cost.
-    for operation in &mut plan.operations {
-        let replacement = match *operation {
-            Operation::Skip {
-                source_index,
-                destination_index,
+    for_each_operation(
+        source_manifest,
+        destination_manifest,
+        plan_options,
+        |operation| {
+            if callback_error.is_some() {
+                return Ok(());
             }
-            | Operation::UpdateMetadata {
-                source_index,
-                destination_index,
-            } => {
-                let (source_path, destination_path) = matched_operation_paths(
-                    source,
-                    destination,
-                    source_manifest,
-                    destination_manifest,
-                    source_index,
-                    destination_index,
-                )?;
-                let compare_start = Instant::now();
-                let compared_bytes = source_manifest.entries[source_index].metadata.len;
-                let contents_match = files_match(&source_path, &destination_path)?;
-                let elapsed = compare_start.elapsed();
-                stats.compared_files += 1;
-                stats.compared_bytes += compared_bytes;
-                stats.elapsed += elapsed;
-                profile_event(
-                    "verify.compare-file",
-                    elapsed,
-                    &[
-                        ("source", source_path.display().to_string()),
-                        ("destination", destination_path.display().to_string()),
-                        ("bytes", compared_bytes.to_string()),
-                        (
-                            "result",
-                            if contents_match {
-                                "same".to_string()
-                            } else {
-                                "different".to_string()
-                            },
-                        ),
-                    ],
-                );
 
-                if contents_match {
-                    None
-                } else {
-                    stats.promoted_to_data += 1;
-                    Some(Operation::UpdateData {
-                        source_index,
-                        destination_index,
-                    })
+            match verify_operation(
+                source,
+                destination,
+                source_manifest,
+                destination_manifest,
+                operation,
+                verify_contents,
+                &mut stats,
+            ) {
+                Ok(operation) => {
+                    on_operation(operation);
+                    Ok(())
+                }
+                Err(error) => {
+                    callback_error = Some(error);
+                    Ok(())
                 }
             }
-            Operation::Create { .. } | Operation::UpdateData { .. } | Operation::Delete { .. } => {
-                None
-            }
-        };
+        },
+    )
+    .map_err(SessionError::from)?;
 
-        if let Some(operation_with_verified_data_change) = replacement {
-            *operation = operation_with_verified_data_change;
-        }
+    if let Some(error) = callback_error {
+        return Err(error);
     }
 
     Ok(stats)
+}
+
+fn verify_operation(
+    source: &LocalEndpoint,
+    destination: &LocalEndpoint,
+    source_manifest: &Manifest,
+    destination_manifest: Option<&Manifest>,
+    operation: Operation,
+    verify_contents: bool,
+    stats: &mut VerificationStats,
+) -> Result<Operation, SessionError> {
+    match operation {
+        Operation::Skip {
+            source_index,
+            destination_index,
+        }
+        | Operation::UpdateMetadata {
+            source_index,
+            destination_index,
+        } if verify_contents => {
+            let (source_path, destination_path) = matched_operation_paths(
+                source,
+                destination,
+                source_manifest,
+                destination_manifest.ok_or(SessionError::MissingDestinationManifest)?,
+                source_index,
+                destination_index,
+            )?;
+            let compared_bytes = source_manifest.entries[source_index].metadata.len;
+            let contents_match = files_match(&source_path, &destination_path)?;
+            stats.compared_files += 1;
+            stats.compared_bytes += compared_bytes;
+
+            if contents_match {
+                Ok(operation)
+            } else {
+                stats.promoted_to_data += 1;
+                Ok(Operation::UpdateData {
+                    source_index,
+                    destination_index,
+                })
+            }
+        }
+        _ => Ok(operation),
+    }
 }
 
 fn matched_operation_paths(
@@ -761,17 +587,12 @@ fn matched_operation_paths(
     // File roots compare exactly one logical source/destination item.
     match source_manifest.root {
         ManifestRoot::Directory => Ok((
-            source
-                .path
-                .join(&source_manifest.entries[source_index].path),
+            source.path.join(&source_manifest.entries[source_index].path),
             destination
                 .path
                 .join(&destination_manifest.entries[destination_index].path),
         )),
-        ManifestRoot::File => Ok((
-            source.path.clone(),
-            resolve_file_target(source, destination)?,
-        )),
+        ManifestRoot::File => Ok((source.path.clone(), resolve_file_target(source, destination)?)),
     }
 }
 
@@ -1021,35 +842,6 @@ mod tests {
         assert_eq!(applied.operations.len(), 1);
         assert_eq!(applied.operations[0].kind.to_string(), "update-data");
         assert_eq!(fs::read(&destination).unwrap(), b"aaa");
-
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn applies_explicit_fixed_strategy_for_local_updates() {
-        let root = temp_path("session-apply-fixed-strategy");
-        fs::create_dir_all(&root).unwrap();
-
-        let source = root.join("alpha.txt");
-        let destination = root.join("beta.txt");
-        fs::write(&source, b"zzabcd1234wxyzyy").unwrap();
-        fs::write(&destination, b"abcd1234wxyz").unwrap();
-
-        let request = Request::from_args(
-            &source.to_string_lossy(),
-            &destination.to_string_lossy(),
-            Options {
-                strategy: Strategy::Fixed,
-                ..Options::default()
-            },
-        )
-        .unwrap();
-
-        let applied = request.apply().unwrap();
-
-        assert_eq!(applied.operations.len(), 1);
-        assert_eq!(applied.operations[0].kind.to_string(), "update-data");
-        assert_eq!(fs::read(&destination).unwrap(), b"zzabcd1234wxyzyy");
 
         fs::remove_dir_all(root).unwrap();
     }

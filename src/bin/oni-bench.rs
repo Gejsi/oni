@@ -137,8 +137,6 @@ struct Cli {
 enum Tool {
     #[value(name = "oni-whole")]
     OniWhole,
-    #[value(name = "oni-fixed")]
-    OniFixed,
     #[value(name = "oni-cdc")]
     OniCdc,
     #[value(name = "rsync")]
@@ -151,7 +149,6 @@ impl Tool {
     fn slug(self) -> &'static str {
         match self {
             Self::OniWhole => "oni-whole",
-            Self::OniFixed => "oni-fixed",
             Self::OniCdc => "oni-cdc",
             Self::Rsync => "rsync",
             Self::RsyncDelta => "rsync-delta",
@@ -215,13 +212,7 @@ struct EnvironmentRecord {
 
 fn selected_tools(cli: &Cli) -> Vec<Tool> {
     if cli.tools.is_empty() {
-        vec![
-            Tool::OniWhole,
-            Tool::OniFixed,
-            Tool::OniCdc,
-            Tool::Rsync,
-            Tool::RsyncDelta,
-        ]
+        vec![Tool::OniWhole, Tool::OniCdc, Tool::Rsync, Tool::RsyncDelta]
     } else {
         cli.tools.clone()
     }
@@ -252,8 +243,6 @@ fn create_output_dir(root: &Path) -> io::Result<PathBuf> {
 }
 
 fn ensure_oni_binary(repo_root: &Path) -> io::Result<PathBuf> {
-    // The user wants Oni measured in debug mode even when the benchmark
-    // harness itself is launched another way, so always target `debug/oni`.
     let oni_binary = repo_root.join("target/debug/oni");
 
     if oni_binary.exists() {
@@ -488,7 +477,7 @@ fn execute_tool(
 
     let (mut command_text, mut command) =
         build_command(tool, oni_binary, &case.source, &case.destination);
-    if profile_oni_local && matches!(tool, Tool::OniWhole | Tool::OniFixed | Tool::OniCdc) {
+    if profile_oni_local && matches!(tool, Tool::OniWhole | Tool::OniCdc) {
         command.env("ONI_PROFILE_LOCAL", "1");
         command_text = format!("ONI_PROFILE_LOCAL=1 {command_text}");
     }
@@ -526,24 +515,6 @@ fn build_command(
             (
                 format!(
                     "{} --delete --strategy whole {} {}",
-                    oni_binary.display(),
-                    source.display(),
-                    destination.display()
-                ),
-                command,
-            )
-        }
-        Tool::OniFixed => {
-            let mut command = Command::new(oni_binary);
-            command
-                .arg("--delete")
-                .arg("--strategy")
-                .arg("fixed")
-                .arg(source)
-                .arg(destination);
-            (
-                format!(
-                    "{} --delete --strategy fixed {} {}",
                     oni_binary.display(),
                     source.display(),
                     destination.display()

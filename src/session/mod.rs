@@ -135,7 +135,6 @@ impl fmt::Display for Mode {
 pub enum Strategy {
     Auto,
     Whole,
-    Fixed,
     Cdc,
 }
 
@@ -144,7 +143,6 @@ impl fmt::Display for Strategy {
         match self {
             Self::Auto => f.write_str("auto"),
             Self::Whole => f.write_str("whole"),
-            Self::Fixed => f.write_str("fixed"),
             Self::Cdc => f.write_str("cdc"),
         }
     }
@@ -152,7 +150,6 @@ impl fmt::Display for Strategy {
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
 pub enum Chunker {
-    Fixed,
     FastCdc,
     SeqCdc,
 }
@@ -160,7 +157,6 @@ pub enum Chunker {
 impl fmt::Display for Chunker {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Fixed => f.write_str("fixed"),
             Self::FastCdc => f.write_str("fastcdc"),
             Self::SeqCdc => f.write_str("seqcdc"),
         }

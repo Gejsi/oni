@@ -4,23 +4,20 @@
 //! - chunk an existing basis file through Oni's FastCDC boundary
 //! - hash each basis chunk strongly
 //! - chunk the source file with the same FastCDC parameters
-//! - reuse matching basis chunks and emit literals for the rest
-//! - replay the recipe against the basis file to reconstruct the source
+//! - turn each source chunk into either a basis reference or a literal write
+//! - stream those decisions directly into a sink
 //!
-//! The implementation deliberately stays simple for the first production
-//! baseline. Each file is chunked and hashed in one forward pass with bounded
-//! memory, but the final copy/literal recipe is still buffered before apply.
+//! The basis side still builds one per-file signature table, but the source
+//! side no longer materializes a full recipe before apply.
 //!
 //! ASCII view:
 //!
 //!   basis file --chunk_read--> chunk bytes --hash--> signature table
-//!   source file --chunk_read--> chunk bytes --hash--> copy/literal recipe
-//!   recipe + basis file -------------------------------> rebuilt output
+//!   source file --chunk_read--> chunk bytes --hash--> reference/literal sink
+//!   sink + basis file --------------------------------> rebuilt output
 //!
-//! The important tradeoff is visible in the diagram: this baseline is simple
-//! and bounded, but it still materializes the final recipe before apply. That
-//! keeps the code easy to reason about for now, but it is still not the final
-//! streaming token pipeline Oni wants over SSH stdio.
+//! The remaining bounded state is the signature table for the basis file. The
+//! old source-side `Vec<RecipeChunk>` is gone from the main path.
 
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -34,31 +31,51 @@ pub use crate::chunker::fastcdc::Config as FastCdcConfig;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ChunkSignature {
+    /// Byte offset of the matching span in the basis file.
     offset: u64,
+    /// Length of that span. FastCDC chunk lengths are variable.
     len: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignatureTable {
+    /// Basis chunks in file order. A later reference points back into this set.
     chunks: Vec<ChunkSignature>,
+    /// Strong-hash index used to find candidate basis chunks for one source chunk.
+    ///
+    /// The value is a `Vec` because duplicate chunk contents can appear more
+    /// than once in the basis file.
     by_hash: HashMap<[u8; 32], Vec<usize>>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum RecipeChunk {
-    Literal(Vec<u8>),
-    Copy { offset: u64, len: usize },
+/// One per-file summary of what the source pass emitted.
+///
+/// These counters keep profiling and tests informative without forcing the CDC
+/// path back into a buffered vector of operations.
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
+pub struct DeltaStats {
+    pub reference_chunks: usize,
+    pub literal_chunks: usize,
+    pub literal_bytes: u64,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Recipe {
-    pub chunks: Vec<RecipeChunk>,
+/// Destination for source-side CDC decisions.
+///
+/// `reference()` means "reuse this span from the basis file"; `literal()`
+/// means "write these source bytes directly".
+pub trait DeltaSink {
+    fn literal(&mut self, bytes: &[u8]) -> Result<(), StrategyError>;
+    fn reference(&mut self, offset: u64, len: usize) -> Result<(), StrategyError>;
 }
 
 pub fn signatures_fastcdc(
     reader: &mut impl Read,
     config: FastCdcConfig,
 ) -> Result<SignatureTable, StrategyError> {
+    // Build one bounded per-file basis index:
+    // - `chunks` keeps the original offset/length for each basis chunk
+    // - `by_hash` lets the source pass jump from one strong hash to candidate
+    //   basis spans without rescanning the whole basis file
     let mut chunks = Vec::new();
     let mut by_hash = HashMap::new();
 
@@ -78,85 +95,147 @@ pub fn signatures_fastcdc(
     Ok(SignatureTable { chunks, by_hash })
 }
 
-pub fn delta_fastcdc(
+/// Stream one source file through the FastCDC matcher and count the emitted
+/// decisions without retaining them.
+pub fn emit_delta_fastcdc(
     reader: &mut impl Read,
     signatures: &SignatureTable,
     config: FastCdcConfig,
-) -> Result<Recipe, StrategyError> {
-    let mut recipe = Recipe { chunks: Vec::new() };
+) -> Result<DeltaStats, StrategyError> {
+    emit_delta_fastcdc_into(reader, signatures, config, &mut DiscardingSink)
+}
+
+/// Stream one source file through the FastCDC matcher and emit basis
+/// references or literal bytes immediately.
+///
+/// This keeps the source side single-pass and lets callers decide how to apply
+/// or forward the delta decisions.
+pub fn emit_delta_fastcdc_into(
+    reader: &mut impl Read,
+    signatures: &SignatureTable,
+    config: FastCdcConfig,
+    sink: &mut impl DeltaSink,
+) -> Result<DeltaStats, StrategyError> {
+    let mut stats = DeltaStats::default();
 
     fastcdc::chunk_read(reader, config, |chunk, bytes| {
         let strong = strong_checksum(bytes);
 
         if let Some(signature) = find_match(signatures, strong, chunk.length) {
-            recipe.chunks.push(RecipeChunk::Copy {
-                offset: signature.offset,
-                len: signature.len,
-            });
+            sink.reference(signature.offset, signature.len)?;
+            stats.reference_chunks += 1;
         } else {
-            push_literal(&mut recipe, bytes);
+            sink.literal(bytes)?;
+            stats.literal_chunks += 1;
+            stats.literal_bytes += bytes.len() as u64;
         }
+
         Ok::<_, StrategyError>(())
     })?;
 
-    Ok(recipe)
+    Ok(stats)
 }
 
-pub fn apply(
-    recipe: &Recipe,
+/// Apply one source file directly into `writer` by rereading referenced spans
+/// from `basis` on demand.
+///
+/// This is the local stepping stone toward the future helper-backed flow:
+/// signatures stay buffered, but source decisions stream straight into the temp
+/// file writer instead of waiting behind an in-memory recipe.
+pub fn apply_fastcdc(
+    reader: &mut impl Read,
+    signatures: &SignatureTable,
+    config: FastCdcConfig,
     basis: &mut (impl Read + Seek),
     writer: &mut impl Write,
-) -> Result<(), StrategyError> {
-    let mut buffer = [0_u8; READ_BUFFER_SIZE];
+) -> Result<DeltaStats, StrategyError> {
+    let mut sink = ApplySink::new(basis, writer);
+    emit_delta_fastcdc_into(reader, signatures, config, &mut sink)
+}
 
-    for chunk in &recipe.chunks {
-        match chunk {
-            RecipeChunk::Literal(bytes) => {
-                writer
-                    .write_all(bytes)
-                    .map_err(|source| StrategyError::Io {
-                        operation: "write literal CDC bytes",
-                        source,
-                    })?;
-            }
-            RecipeChunk::Copy { offset, len } => {
-                basis
-                    .seek(SeekFrom::Start(*offset))
-                    .map_err(|source| StrategyError::Io {
-                        operation: "seek basis file for CDC chunk copy",
-                        source,
-                    })?;
+struct DiscardingSink;
 
-                let mut remaining = *len;
-                while remaining > 0 {
-                    let read_len = remaining.min(buffer.len());
-                    let read = basis.read(&mut buffer[..read_len]).map_err(|source| {
-                        StrategyError::Io {
-                            operation: "read referenced CDC basis chunk",
-                            source,
-                        }
-                    })?;
-
-                    if read == 0 {
-                        return Err(StrategyError::InvalidBasisSpan {
-                            offset: *offset,
-                            len: *len,
-                        });
-                    }
-
-                    writer
-                        .write_all(&buffer[..read])
-                        .map_err(|source| StrategyError::Io {
-                            operation: "write copied CDC bytes",
-                            source,
-                        })?;
-                    remaining -= read;
-                }
-            }
-        }
+impl DeltaSink for DiscardingSink {
+    fn literal(&mut self, _bytes: &[u8]) -> Result<(), StrategyError> {
+        Ok(())
     }
 
-    Ok(())
+    fn reference(&mut self, _offset: u64, _len: usize) -> Result<(), StrategyError> {
+        Ok(())
+    }
+}
+
+struct ApplySink<'a, R, W> {
+    basis: &'a mut R,
+    writer: &'a mut W,
+    buffer: [u8; READ_BUFFER_SIZE],
+}
+
+impl<'a, R, W> ApplySink<'a, R, W>
+where
+    R: Read + Seek,
+    W: Write,
+{
+    fn new(basis: &'a mut R, writer: &'a mut W) -> Self {
+        Self {
+            basis,
+            writer,
+            buffer: [0_u8; READ_BUFFER_SIZE],
+        }
+    }
+}
+
+impl<R, W> DeltaSink for ApplySink<'_, R, W>
+where
+    R: Read + Seek,
+    W: Write,
+{
+    fn literal(&mut self, bytes: &[u8]) -> Result<(), StrategyError> {
+        self.writer
+            .write_all(bytes)
+            .map_err(|source| StrategyError::Io {
+                operation: "write literal CDC bytes",
+                source,
+            })
+    }
+
+    fn reference(&mut self, offset: u64, len: usize) -> Result<(), StrategyError> {
+        // References intentionally reread the basis file on demand. That keeps
+        // the apply path bounded and mirrors the future helper-side execution
+        // shape more closely than buffering copied bytes ahead of time.
+        self.basis
+            .seek(SeekFrom::Start(offset))
+            .map_err(|source| StrategyError::Io {
+                operation: "seek basis file for CDC reference",
+                source,
+            })?;
+
+        let mut remaining = len;
+        while remaining > 0 {
+            let read_len = remaining.min(self.buffer.len());
+            let read = self
+                .basis
+                .read(&mut self.buffer[..read_len])
+                .map_err(|source| StrategyError::Io {
+                    operation: "read referenced CDC basis span",
+                    source,
+                })?;
+
+            if read == 0 {
+                return Err(StrategyError::InvalidBasisSpan { offset, len });
+            }
+
+            self.writer
+                .write_all(&self.buffer[..read])
+                .map_err(|source| StrategyError::Io {
+                    operation: "write referenced CDC bytes",
+                    source,
+                })?;
+            remaining -= read;
+        }
+
+        Ok(())
+    }
 }
 
 fn strong_checksum(bytes: &[u8]) -> [u8; 32] {
@@ -175,22 +254,46 @@ fn find_match<'a>(
     })
 }
 
-fn push_literal(recipe: &mut Recipe, bytes: &[u8]) {
-    if bytes.is_empty() {
-        return;
-    }
-
-    match recipe.chunks.last_mut() {
-        Some(RecipeChunk::Literal(existing)) => existing.extend_from_slice(bytes),
-        _ => recipe.chunks.push(RecipeChunk::Literal(bytes.to_vec())),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::io::Cursor;
 
-    use super::{apply, delta_fastcdc, signatures_fastcdc, FastCdcConfig, RecipeChunk};
+    use super::{
+        apply_fastcdc, emit_delta_fastcdc, emit_delta_fastcdc_into, signatures_fastcdc, DeltaSink,
+        FastCdcConfig,
+    };
+    use crate::error::StrategyError;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum RecordedChunk {
+        Literal(Vec<u8>),
+        Reference { offset: u64, len: usize },
+    }
+
+    #[derive(Debug, Default)]
+    struct RecordingSink {
+        chunks: Vec<RecordedChunk>,
+    }
+
+    impl DeltaSink for RecordingSink {
+        fn literal(&mut self, bytes: &[u8]) -> Result<(), StrategyError> {
+            if bytes.is_empty() {
+                return Ok(());
+            }
+
+            match self.chunks.last_mut() {
+                Some(RecordedChunk::Literal(existing)) => existing.extend_from_slice(bytes),
+                _ => self.chunks.push(RecordedChunk::Literal(bytes.to_vec())),
+            }
+
+            Ok(())
+        }
+
+        fn reference(&mut self, offset: u64, len: usize) -> Result<(), StrategyError> {
+            self.chunks.push(RecordedChunk::Reference { offset, len });
+            Ok(())
+        }
+    }
 
     fn patterned_bytes(len: usize) -> Vec<u8> {
         (0..len)
@@ -199,26 +302,43 @@ mod tests {
     }
 
     #[test]
-    fn identical_files_turn_into_copy_only_recipes() {
+    fn identical_files_turn_into_reference_only_streams() {
         let basis_bytes = patterned_bytes(256 * 1024);
         let config = FastCdcConfig::default();
 
         let signatures = signatures_fastcdc(&mut Cursor::new(&basis_bytes), config).unwrap();
-        let recipe = delta_fastcdc(&mut Cursor::new(&basis_bytes), &signatures, config).unwrap();
+        let mut recorded = RecordingSink::default();
+        let stats = emit_delta_fastcdc_into(
+            &mut Cursor::new(&basis_bytes),
+            &signatures,
+            config,
+            &mut recorded,
+        )
+        .unwrap();
 
-        assert!(!recipe.chunks.is_empty());
-        assert!(recipe
+        assert!(stats.reference_chunks > 0);
+        assert_eq!(stats.literal_chunks, 0);
+        assert!(recorded
             .chunks
             .iter()
-            .all(|chunk| matches!(chunk, RecipeChunk::Copy { .. })));
+            .all(|chunk| matches!(chunk, RecordedChunk::Reference { .. })));
 
         let mut rebuilt = Vec::new();
-        apply(&recipe, &mut Cursor::new(&basis_bytes), &mut rebuilt).unwrap();
+        let mut basis_reader = Cursor::new(&basis_bytes);
+        let apply_stats = apply_fastcdc(
+            &mut Cursor::new(&basis_bytes),
+            &signatures,
+            config,
+            &mut basis_reader,
+            &mut rebuilt,
+        )
+        .unwrap();
+        assert_eq!(apply_stats.literal_chunks, 0);
         assert_eq!(rebuilt, basis_bytes);
     }
 
     #[test]
-    fn shifted_inserts_preserve_copy_reuse_and_rebuild_the_source() {
+    fn shifted_inserts_preserve_reference_reuse_and_rebuild_the_source() {
         let basis_bytes = patterned_bytes(320 * 1024);
         let mut source_bytes = basis_bytes[..128 * 1024].to_vec();
         source_bytes.extend(std::iter::repeat_n(b'!', 4 * 1024));
@@ -226,19 +346,36 @@ mod tests {
         let config = FastCdcConfig::default();
 
         let signatures = signatures_fastcdc(&mut Cursor::new(&basis_bytes), config).unwrap();
-        let recipe = delta_fastcdc(&mut Cursor::new(&source_bytes), &signatures, config).unwrap();
+        let mut recorded = RecordingSink::default();
+        let stats = emit_delta_fastcdc_into(
+            &mut Cursor::new(&source_bytes),
+            &signatures,
+            config,
+            &mut recorded,
+        )
+        .unwrap();
 
-        assert!(recipe
+        assert!(recorded
             .chunks
             .iter()
-            .any(|chunk| matches!(chunk, RecipeChunk::Copy { .. })));
-        assert!(recipe
+            .any(|chunk| matches!(chunk, RecordedChunk::Reference { .. })));
+        assert!(recorded
             .chunks
             .iter()
-            .any(|chunk| matches!(chunk, RecipeChunk::Literal(_))));
+            .any(|chunk| matches!(chunk, RecordedChunk::Literal(_))));
+        assert!(stats.reference_chunks > 0);
+        assert!(stats.literal_chunks > 0);
 
         let mut rebuilt = Vec::new();
-        apply(&recipe, &mut Cursor::new(&basis_bytes), &mut rebuilt).unwrap();
+        let mut basis_reader = Cursor::new(&basis_bytes);
+        apply_fastcdc(
+            &mut Cursor::new(&source_bytes),
+            &signatures,
+            config,
+            &mut basis_reader,
+            &mut rebuilt,
+        )
+        .unwrap();
         assert_eq!(rebuilt, source_bytes);
     }
 
@@ -246,14 +383,25 @@ mod tests {
     fn equal_size_overwrites_still_rebuild_the_source() {
         let basis_bytes = patterned_bytes(192 * 1024);
         let mut source_bytes = basis_bytes.clone();
-        source_bytes[80 * 1024..84 * 1024].fill(b'?');
+        source_bytes[64 * 1024..64 * 1024 + 18].copy_from_slice(b"replacement-bytes!");
         let config = FastCdcConfig::default();
 
         let signatures = signatures_fastcdc(&mut Cursor::new(&basis_bytes), config).unwrap();
-        let recipe = delta_fastcdc(&mut Cursor::new(&source_bytes), &signatures, config).unwrap();
+        let stats =
+            emit_delta_fastcdc(&mut Cursor::new(&source_bytes), &signatures, config).unwrap();
+
+        assert!(stats.literal_chunks > 0);
 
         let mut rebuilt = Vec::new();
-        apply(&recipe, &mut Cursor::new(&basis_bytes), &mut rebuilt).unwrap();
+        let mut basis_reader = Cursor::new(&basis_bytes);
+        apply_fastcdc(
+            &mut Cursor::new(&source_bytes),
+            &signatures,
+            config,
+            &mut basis_reader,
+            &mut rebuilt,
+        )
+        .unwrap();
         assert_eq!(rebuilt, source_bytes);
     }
 }

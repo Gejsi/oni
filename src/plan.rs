@@ -7,7 +7,7 @@
 use crate::error::PlanError;
 use crate::manifest::{Manifest, ManifestEntry, ManifestRoot};
 
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
 pub struct PlanOptions {
     /// When false, destination-only paths are ignored instead of planned as deletes.
     pub delete_extraneous: bool,
@@ -72,131 +72,101 @@ impl Operation {
     }
 }
 
-/// Deterministic plan done by walking the sorted manifests.
-///
-/// Current shape:
-/// - materialize full source and destination manifests
-/// - build a full `Vec<Operation>`
-/// - let later stages verify, execute, and report in additional passes
-///
-/// This is good scaffolding because it keeps planning pure, deterministic, and
-/// easy to test.
-///
-/// It is not the final performance shape.
-///
-/// Long-term direction:
-/// - keep `manifest` and `plan` as separate logical phases
-/// - stop requiring the planner to materialize the whole `Vec<Operation>` up
-///   front before the executor can do anything useful
-/// - evolve toward a merge iterator or consumer-style API such as
-///   `plan_with(..., |operation| ...)`
-///
-/// That would preserve the current simple merge logic while removing one
-/// buffering stage and fitting remote/helper-backed execution better.
-#[derive(Debug)]
-pub struct Plan {
-    pub operations: Vec<Operation>,
-}
+/// Deterministic planner that walks the sorted manifests and emits each
+/// operation immediately into the caller's sink.
+pub fn for_each_operation(
+    source: &Manifest,
+    destination: Option<&Manifest>,
+    options: PlanOptions,
+    mut on_operation: impl FnMut(Operation) -> Result<(), PlanError>,
+) -> Result<(), PlanError> {
+    // No destination means every source entry must be created.
+    let Some(destination) = destination else {
+        for (source_index, _) in source.entries.iter().enumerate() {
+            on_operation(Operation::Create { source_index })?;
+        }
+        return Ok(());
+    };
 
-impl Plan {
-    pub fn build(
-        source: &Manifest,
-        destination: Option<&Manifest>,
-        options: PlanOptions,
-    ) -> Result<Self, PlanError> {
-        // No destination means every source entry must be created
-        let Some(destination) = destination else {
-            return Ok(Self {
-                operations: source
-                    .entries
-                    .iter()
-                    .enumerate()
-                    .map(|(source_index, _)| Operation::Create { source_index })
-                    .collect(),
+    match (source.root, destination.root) {
+        // Reject `file -> directory` and `directory -> file`
+        // because those roots cannot be merged against each other.
+        (ManifestRoot::File, ManifestRoot::Directory)
+        | (ManifestRoot::Directory, ManifestRoot::File) => {
+            return Err(PlanError::RootKindMismatch {
+                source_root: source.root,
+                destination_root: destination.root,
             });
-        };
-
-        match (source.root, destination.root) {
-            // Reject `file -> directory` and `directory -> file`
-            // because those roots cannot be merged against each other.
-            (ManifestRoot::File, ManifestRoot::Directory)
-            | (ManifestRoot::Directory, ManifestRoot::File) => {
-                return Err(PlanError::RootKindMismatch {
-                    source_root: source.root,
-                    destination_root: destination.root,
-                });
-            }
-            (ManifestRoot::File, ManifestRoot::File) => {
-                // File roots are planned as one logical item. The source may be
-                // `a.txt` and the destination `b.txt`, but that is still a single
-                // replace-or-skip decision.
-                let source_entry = &source.entries[0];
-                let destination_entry = &destination.entries[0];
-                let operation =
-                    Operation::classify_matched_entries(source_entry, destination_entry, 0, 0);
-
-                return Ok(Self {
-                    operations: vec![operation],
-                });
-            }
-            (ManifestRoot::Directory, ManifestRoot::Directory) => {}
         }
+        (ManifestRoot::File, ManifestRoot::File) => {
+            // File roots are planned as one logical item. The source may be
+            // `a.txt` and the destination `b.txt`, but that is still a single
+            // replace-or-skip decision.
+            let source_entry = &source.entries[0];
+            let destination_entry = &destination.entries[0];
+            return on_operation(Operation::classify_matched_entries(
+                source_entry,
+                destination_entry,
+                0,
+                0,
+            ));
+        }
+        (ManifestRoot::Directory, ManifestRoot::Directory) => {}
+    }
 
-        let mut operations = Vec::with_capacity(source.entries.len() + destination.entries.len());
-        let mut source_index = 0;
-        let mut destination_index = 0;
+    let mut source_index = 0;
+    let mut destination_index = 0;
 
-        while source_index < source.entries.len() && destination_index < destination.entries.len() {
-            let source_entry = &source.entries[source_index];
-            let destination_entry = &destination.entries[destination_index];
+    while source_index < source.entries.len() && destination_index < destination.entries.len() {
+        let source_entry = &source.entries[source_index];
+        let destination_entry = &destination.entries[destination_index];
 
-            // Both manifests are sorted by relative path
-            // This lets the planner do one linear merge-style walk
-            match source_entry.path.cmp(&destination_entry.path) {
-                std::cmp::Ordering::Less => {
-                    operations.push(Operation::Create { source_index });
-                    source_index += 1;
-                }
-                std::cmp::Ordering::Greater => {
-                    if options.delete_extraneous {
-                        operations.push(Operation::Delete { destination_index });
-                    }
-                    destination_index += 1;
-                }
-                std::cmp::Ordering::Equal => {
-                    operations.push(Operation::classify_matched_entries(
-                        source_entry,
-                        destination_entry,
-                        source_index,
-                        destination_index,
-                    ));
-                    source_index += 1;
-                    destination_index += 1;
-                }
+        // Both manifests are sorted by relative path.
+        // This lets the planner do one linear merge-style walk.
+        match source_entry.path.cmp(&destination_entry.path) {
+            std::cmp::Ordering::Less => {
+                on_operation(Operation::Create { source_index })?;
+                source_index += 1;
             }
-        }
-
-        while source_index < source.entries.len() {
-            operations.push(Operation::Create { source_index });
-            source_index += 1;
-        }
-
-        if options.delete_extraneous {
-            while destination_index < destination.entries.len() {
-                operations.push(Operation::Delete { destination_index });
+            std::cmp::Ordering::Greater => {
+                if options.delete_extraneous {
+                    on_operation(Operation::Delete { destination_index })?;
+                }
+                destination_index += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                on_operation(Operation::classify_matched_entries(
+                    source_entry,
+                    destination_entry,
+                    source_index,
+                    destination_index,
+                ))?;
+                source_index += 1;
                 destination_index += 1;
             }
         }
-
-        Ok(Self { operations })
     }
+
+    while source_index < source.entries.len() {
+        on_operation(Operation::Create { source_index })?;
+        source_index += 1;
+    }
+
+    if options.delete_extraneous {
+        while destination_index < destination.entries.len() {
+            on_operation(Operation::Delete { destination_index })?;
+            destination_index += 1;
+        }
+    }
+
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use std::path::PathBuf;
 
-    use super::{Operation, Plan, PlanOptions};
+    use super::{for_each_operation, Operation, PlanOptions};
     use crate::error::PlanError;
     use crate::manifest::{EntryKind, EntryMetadata, Manifest, ManifestEntry, ManifestRoot};
 
@@ -204,10 +174,8 @@ mod tests {
     fn plans_create_for_missing_destination() {
         let source = directory_manifest(&[("notes/today.txt", 12), ("photos/cover.jpg", 32)]);
 
-        let plan = Plan::build(&source, None, PlanOptions::default()).unwrap();
-
         assert_eq!(
-            plan.operations,
+            collect_operations(&source, None, PlanOptions::default()).unwrap(),
             vec![
                 Operation::Create { source_index: 0 },
                 Operation::Create { source_index: 1 },
@@ -220,10 +188,8 @@ mod tests {
         let source = file_manifest("todo.txt", 3, 10);
         let destination = file_manifest("todo.txt", 3, 10);
 
-        let plan = Plan::build(&source, Some(&destination), PlanOptions::default()).unwrap();
-
         assert_eq!(
-            plan.operations,
+            collect_operations(&source, Some(&destination), PlanOptions::default()).unwrap(),
             vec![Operation::Skip {
                 source_index: 0,
                 destination_index: 0,
@@ -235,9 +201,10 @@ mod tests {
     fn plans_create_for_missing_file_root_destination() {
         let source = file_manifest("todo.txt", 3, 10);
 
-        let plan = Plan::build(&source, None, PlanOptions::default()).unwrap();
-
-        assert_eq!(plan.operations, vec![Operation::Create { source_index: 0 }]);
+        assert_eq!(
+            collect_operations(&source, None, PlanOptions::default()).unwrap(),
+            vec![Operation::Create { source_index: 0 }]
+        );
     }
 
     #[test]
@@ -245,10 +212,8 @@ mod tests {
         let source = file_manifest("todo.txt", 4, 11);
         let destination = file_manifest("todo.txt", 3, 10);
 
-        let plan = Plan::build(&source, Some(&destination), PlanOptions::default()).unwrap();
-
         assert_eq!(
-            plan.operations,
+            collect_operations(&source, Some(&destination), PlanOptions::default()).unwrap(),
             vec![Operation::UpdateData {
                 source_index: 0,
                 destination_index: 0,
@@ -261,10 +226,8 @@ mod tests {
         let source = file_manifest("source.txt", 4, 11);
         let destination = file_manifest("destination.txt", 3, 10);
 
-        let plan = Plan::build(&source, Some(&destination), PlanOptions::default()).unwrap();
-
         assert_eq!(
-            plan.operations,
+            collect_operations(&source, Some(&destination), PlanOptions::default()).unwrap(),
             vec![Operation::UpdateData {
                 source_index: 0,
                 destination_index: 0,
@@ -277,10 +240,8 @@ mod tests {
         let source = file_manifest("todo.txt", 3, 11);
         let destination = file_manifest("todo.txt", 3, 10);
 
-        let plan = Plan::build(&source, Some(&destination), PlanOptions::default()).unwrap();
-
         assert_eq!(
-            plan.operations,
+            collect_operations(&source, Some(&destination), PlanOptions::default()).unwrap(),
             vec![Operation::UpdateMetadata {
                 source_index: 0,
                 destination_index: 0,
@@ -293,10 +254,8 @@ mod tests {
         let source = directory_manifest(&[("a.txt", 1), ("b.txt", 2), ("c.txt", 3)]);
         let destination = directory_manifest(&[("a.txt", 1), ("b.txt", 2), ("c.txt", 3)]);
 
-        let plan = Plan::build(&source, Some(&destination), PlanOptions::default()).unwrap();
-
         assert_eq!(
-            plan.operations,
+            collect_operations(&source, Some(&destination), PlanOptions::default()).unwrap(),
             vec![
                 Operation::Skip {
                     source_index: 0,
@@ -319,10 +278,8 @@ mod tests {
         let source = directory_manifest_with_mtime(&[("a.txt", 1, 11)]);
         let destination = directory_manifest_with_mtime(&[("a.txt", 1, 10)]);
 
-        let plan = Plan::build(&source, Some(&destination), PlanOptions::default()).unwrap();
-
         assert_eq!(
-            plan.operations,
+            collect_operations(&source, Some(&destination), PlanOptions::default()).unwrap(),
             vec![Operation::UpdateMetadata {
                 source_index: 0,
                 destination_index: 0,
@@ -335,17 +292,15 @@ mod tests {
         let source = directory_manifest(&[("a.txt", 1), ("c.txt", 3), ("d.txt", 4)]);
         let destination = directory_manifest(&[("a.txt", 1), ("b.txt", 2), ("d.txt", 4)]);
 
-        let plan = Plan::build(
-            &source,
-            Some(&destination),
-            PlanOptions {
-                delete_extraneous: true,
-            },
-        )
-        .unwrap();
-
         assert_eq!(
-            plan.operations,
+            collect_operations(
+                &source,
+                Some(&destination),
+                PlanOptions {
+                    delete_extraneous: true,
+                },
+            )
+            .unwrap(),
             vec![
                 Operation::Skip {
                     source_index: 0,
@@ -368,10 +323,8 @@ mod tests {
         let source = directory_manifest(&[("a.txt", 1), ("b.txt", 2), ("c.txt", 3)]);
         let destination = directory_manifest(&[("a.txt", 1)]);
 
-        let plan = Plan::build(&source, Some(&destination), PlanOptions::default()).unwrap();
-
         assert_eq!(
-            plan.operations,
+            collect_operations(&source, Some(&destination), PlanOptions::default()).unwrap(),
             vec![
                 Operation::Skip {
                     source_index: 0,
@@ -384,14 +337,12 @@ mod tests {
     }
 
     #[test]
-    fn ignores_extraneous_destination_entries_when_delete_is_disabled() {
+    fn ignores_destination_only_entries_when_delete_is_disabled() {
         let source = directory_manifest(&[("a.txt", 1)]);
         let destination = directory_manifest(&[("a.txt", 1), ("b.txt", 2)]);
 
-        let plan = Plan::build(&source, Some(&destination), PlanOptions::default()).unwrap();
-
         assert_eq!(
-            plan.operations,
+            collect_operations(&source, Some(&destination), PlanOptions::default()).unwrap(),
             vec![Operation::Skip {
                 source_index: 0,
                 destination_index: 0,
@@ -404,17 +355,15 @@ mod tests {
         let source = directory_manifest(&[("a.txt", 1)]);
         let destination = directory_manifest(&[("a.txt", 1), ("b.txt", 2), ("c.txt", 3)]);
 
-        let plan = Plan::build(
-            &source,
-            Some(&destination),
-            PlanOptions {
-                delete_extraneous: true,
-            },
-        )
-        .unwrap();
-
         assert_eq!(
-            plan.operations,
+            collect_operations(
+                &source,
+                Some(&destination),
+                PlanOptions {
+                    delete_extraneous: true,
+                },
+            )
+            .unwrap(),
             vec![
                 Operation::Skip {
                     source_index: 0,
@@ -435,15 +384,16 @@ mod tests {
         let source = file_manifest("todo.txt", 3, 10);
         let destination = directory_manifest(&[("todo.txt", 3)]);
 
-        let error = Plan::build(&source, Some(&destination), PlanOptions::default()).unwrap_err();
+        let error =
+            collect_operations(&source, Some(&destination), PlanOptions::default()).unwrap_err();
 
-        assert_eq!(
+        assert!(matches!(
             error,
             PlanError::RootKindMismatch {
                 source_root: ManifestRoot::File,
                 destination_root: ManifestRoot::Directory,
             }
-        );
+        ));
     }
 
     #[test]
@@ -451,27 +401,38 @@ mod tests {
         let source = directory_manifest(&[("todo.txt", 3)]);
         let destination = file_manifest("todo.txt", 3, 10);
 
-        let error = Plan::build(&source, Some(&destination), PlanOptions::default()).unwrap_err();
+        let error =
+            collect_operations(&source, Some(&destination), PlanOptions::default()).unwrap_err();
 
-        assert_eq!(
+        assert!(matches!(
             error,
             PlanError::RootKindMismatch {
                 source_root: ManifestRoot::Directory,
                 destination_root: ManifestRoot::File,
             }
-        );
+        ));
     }
 
     #[test]
-    fn allows_empty_source_directories() {
-        let source = Manifest {
-            root: ManifestRoot::Directory,
-            entries: Vec::new(),
-        };
+    fn returns_no_operations_for_missing_empty_directory_destination() {
+        let source = directory_manifest(&[]);
 
-        let plan = Plan::build(&source, None, PlanOptions::default()).unwrap();
+        assert!(collect_operations(&source, None, PlanOptions::default())
+            .unwrap()
+            .is_empty());
+    }
 
-        assert!(plan.operations.is_empty());
+    fn collect_operations(
+        source: &Manifest,
+        destination: Option<&Manifest>,
+        options: PlanOptions,
+    ) -> Result<Vec<Operation>, PlanError> {
+        let mut operations = Vec::new();
+        for_each_operation(source, destination, options, |operation| {
+            operations.push(operation);
+            Ok(())
+        })?;
+        Ok(operations)
     }
 
     fn file_manifest(path: &str, len: u64, modified_unix_secs: u64) -> Manifest {
@@ -492,7 +453,8 @@ mod tests {
         directory_manifest_with_mtime(
             &entries
                 .iter()
-                .map(|(path, len)| (*path, *len, *len))
+                .copied()
+                .map(|(path, len)| (path, len, 10))
                 .collect::<Vec<_>>(),
         )
     }
@@ -502,12 +464,13 @@ mod tests {
             root: ManifestRoot::Directory,
             entries: entries
                 .iter()
+                .copied()
                 .map(|(path, len, modified_unix_secs)| ManifestEntry {
                     path: PathBuf::from(path),
                     kind: EntryKind::File,
                     metadata: EntryMetadata {
-                        len: *len,
-                        modified_unix_secs: Some(*modified_unix_secs),
+                        len,
+                        modified_unix_secs: Some(modified_unix_secs),
                     },
                 })
                 .collect(),

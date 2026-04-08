@@ -100,8 +100,6 @@ pub enum StrategyArg {
     Auto,
     /// Always replace changed files wholesale.
     Whole,
-    /// Use the fixed-size rsync-style delta path.
-    Fixed,
     /// Use the content-defined chunking delta path.
     Cdc,
 }
@@ -111,7 +109,6 @@ impl From<StrategyArg> for Strategy {
         match value {
             StrategyArg::Auto => Self::Auto,
             StrategyArg::Whole => Self::Whole,
-            StrategyArg::Fixed => Self::Fixed,
             StrategyArg::Cdc => Self::Cdc,
         }
     }
@@ -119,8 +116,6 @@ impl From<StrategyArg> for Strategy {
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
 pub enum ChunkerArg {
-    /// Reserved for future non-FastCDC chunking experiments.
-    Fixed,
     #[value(name = "fastcdc")]
     FastCdc,
     #[value(name = "seqcdc")]
@@ -130,7 +125,6 @@ pub enum ChunkerArg {
 impl From<ChunkerArg> for Chunker {
     fn from(value: ChunkerArg) -> Self {
         match value {
-            ChunkerArg::Fixed => Self::Fixed,
             ChunkerArg::FastCdc => Self::FastCdc,
             ChunkerArg::SeqCdc => Self::SeqCdc,
         }

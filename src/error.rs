@@ -150,8 +150,6 @@ pub enum StrategyError {
         #[source]
         source: io::Error,
     },
-    #[error("fixed-size delta recipe references a missing basis block: {block_index}")]
-    InvalidBlockReference { block_index: usize },
     #[error(
         "CDC delta recipe references a missing basis span at offset {offset} with length {len}"
     )]

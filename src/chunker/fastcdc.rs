@@ -93,7 +93,7 @@ impl Default for Config {
     }
 }
 
-#[derive(Debug, Copy, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct Chunk {
     /// Rolling FastCDC hash at the end of this chunk.
     pub hash: u64,
@@ -105,7 +105,7 @@ pub struct Chunk {
 
 /// Chunk an in-memory slice.
 ///
-/// This is the natural fit for mmap-backed local file fast paths because the
+/// Useful for mmap-backed local file fast paths because the
 /// caller already owns one contiguous readable view of the input bytes.
 pub fn chunk_slice<E, F>(data: &[u8], config: Config, mut on_chunk: F) -> Result<(), E>
 where
