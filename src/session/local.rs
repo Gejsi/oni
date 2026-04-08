@@ -30,7 +30,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::error::SessionError;
-use crate::fs as fs_ops;
+use crate::staging;
 use crate::manifest::{Manifest, ManifestRoot};
 use crate::path::LocalEndpoint;
 use crate::plan::{Operation, PlanOptions, for_each_operation};
@@ -159,7 +159,7 @@ fn execute_plan(
     options: &Options,
 ) -> Result<(), SessionError> {
     // The local executor keeps one simple rule: consume planned operations in
-    // order, and make each file change crash-safe via `fs.rs`.
+    // order, and make each file change crash-safe via `staging.rs`.
     let mut execution_error: Option<SessionError> = None;
 
     for_each_verified_operation(
@@ -206,7 +206,7 @@ fn execute_operation(
         Operation::Create { source_index } => {
             let (source_path, destination_path) =
                 create_operation_paths(source, destination, source_manifest, source_index)?;
-            fs_ops::replace_file(&source_path, &destination_path)?;
+            staging::replace_file(&source_path, &destination_path)?;
         }
         Operation::UpdateData {
             source_index,
@@ -234,7 +234,7 @@ fn execute_operation(
                 source_index,
                 destination_index,
             )?;
-            fs_ops::sync_metadata(&source_path, &destination_path)?;
+            staging::sync_metadata(&source_path, &destination_path)?;
         }
         Operation::Delete { destination_index } => {
             let destination_path = delete_operation_path(
@@ -243,9 +243,9 @@ fn execute_operation(
                 destination_manifest.ok_or(SessionError::MissingDestinationManifest)?,
                 destination_index,
             )?;
-            fs_ops::remove_file(&destination_path)?;
+            staging::remove_file(&destination_path)?;
             if source_manifest.root == ManifestRoot::Directory {
-                fs_ops::prune_empty_parent_directories(&destination_path, &destination.path)?;
+                staging::prune_empty_parent_directories(&destination_path, &destination.path)?;
             }
         }
         Operation::Skip { .. } => {}
@@ -259,7 +259,7 @@ fn apply_data_update(
     destination_path: &Path,
     options: &Options,
 ) -> Result<(), SessionError> {
-    // Strategy dispatch stays here instead of in `fs.rs` so the filesystem
+    // Strategy dispatch stays here instead of in `staging.rs` so the filesystem
     // helpers remain dumb and reusable.
     //
     // `Auto` is intentionally conservative today:
@@ -270,7 +270,7 @@ fn apply_data_update(
     // The real heuristic selector belongs here later.
     match options.strategy {
         super::Strategy::Auto | super::Strategy::Whole => {
-            fs_ops::replace_file(source_path, destination_path)
+            staging::replace_file(source_path, destination_path)
         }
         super::Strategy::Cdc => apply_cdc_delta_update(source_path, destination_path, options),
     }
@@ -318,7 +318,7 @@ fn apply_fastcdc_delta_update(
         path: source_path.to_path_buf(),
         source,
     })?;
-    fs_ops::replace_with_writer(source_path, destination_path, |writer| {
+    staging::replace_with_writer(source_path, destination_path, |writer| {
         let mut basis_apply_file =
             File::open(destination_path).map_err(|source| SessionError::ApplyIo {
                 operation: "reopen destination basis file for FastCDC delta apply",

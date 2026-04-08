@@ -20,7 +20,7 @@
 //!          fsync parent directory
 
 use std::ffi::OsString;
-use std::fs::{self as std_fs, File, Metadata, OpenOptions};
+use std::fs::{self, File, Metadata, OpenOptions};
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -62,14 +62,14 @@ pub fn replace_with_writer(
     // into a temp file without knowing anything about temp-file naming, rename
     // rules, or parent-directory syncing.
     let parent = parent_directory(destination);
-    std_fs::create_dir_all(parent).map_err(|source_error| SessionError::ApplyIo {
+    fs::create_dir_all(parent).map_err(|source_error| SessionError::ApplyIo {
         operation: "create destination parent directory",
         path: parent.to_path_buf(),
         source: source_error,
     })?;
 
     let source_metadata =
-        std_fs::metadata(source_metadata_path).map_err(|source_error| SessionError::ApplyIo {
+        fs::metadata(source_metadata_path).map_err(|source_error| SessionError::ApplyIo {
             operation: "read source metadata",
             path: source_metadata_path.to_path_buf(),
             source: source_error,
@@ -83,12 +83,11 @@ pub fn replace_with_writer(
 
 /// Apply metadata-only changes to an existing file without rewriting contents.
 pub fn sync_metadata(source: &Path, destination: &Path) -> Result<(), SessionError> {
-    let source_metadata =
-        std_fs::metadata(source).map_err(|source_error| SessionError::ApplyIo {
-            operation: "read source metadata",
-            path: source.to_path_buf(),
-            source: source_error,
-        })?;
+    let source_metadata = fs::metadata(source).map_err(|source_error| SessionError::ApplyIo {
+        operation: "read source metadata",
+        path: source.to_path_buf(),
+        source: source_error,
+    })?;
     let destination_file =
         File::options()
             .read(true)
@@ -112,7 +111,7 @@ pub fn sync_metadata(source: &Path, destination: &Path) -> Result<(), SessionErr
 }
 
 pub fn remove_file(path: &Path) -> Result<(), SessionError> {
-    std_fs::remove_file(path).map_err(|source_error| SessionError::ApplyIo {
+    fs::remove_file(path).map_err(|source_error| SessionError::ApplyIo {
         operation: "remove destination file",
         path: path.to_path_buf(),
         source: source_error,
@@ -126,7 +125,7 @@ pub fn prune_empty_parent_directories(path: &Path, root: &Path) -> Result<(), Se
     let mut current = parent_directory(path);
 
     while current.starts_with(root) && current != root {
-        match std_fs::remove_dir(current) {
+        match fs::remove_dir(current) {
             Ok(()) => {
                 sync_parent_directory(current)?;
                 current = parent_directory(current);
@@ -285,7 +284,7 @@ impl PendingFile {
             })?;
         drop(file);
 
-        std_fs::rename(&self.path, destination).map_err(|source_error| SessionError::ApplyIo {
+        fs::rename(&self.path, destination).map_err(|source_error| SessionError::ApplyIo {
             operation: "rename temporary file into place",
             path: destination.to_path_buf(),
             source: source_error,
@@ -317,6 +316,6 @@ impl Drop for PendingFile {
             drop(file);
         }
 
-        let _ = std_fs::remove_file(&self.path);
+        let _ = fs::remove_file(&self.path);
     }
 }
