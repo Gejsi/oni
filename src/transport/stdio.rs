@@ -65,7 +65,7 @@ impl<R: Read, W: Write> Connection<R, W> {
     pub fn receive_frame(&mut self) -> Result<Option<Vec<u8>>, TransportError> {
         // `None` means clean EOF before a new frame started.
         // Any EOF after a partial prefix becomes an explicit transport error.
-        let Some(length_prefix) = read_length_prefix(&mut self.reader)? else {
+        let Some(length_prefix) = self.read_length_prefix()? else {
             return Ok(None);
         };
 
@@ -87,36 +87,37 @@ impl<R: Read, W: Write> Connection<R, W> {
 
         Ok(Some(payload))
     }
-}
 
-fn read_length_prefix<R: Read>(reader: &mut R) -> Result<Option<[u8; 4]>, TransportError> {
-    let mut prefix = [0_u8; 4];
-    let mut offset = 0;
+    fn read_length_prefix(&mut self) -> Result<Option<[u8; 4]>, TransportError> {
+        let mut prefix = [0_u8; 4];
+        let mut offset = 0;
 
-    while offset < prefix.len() {
-        // Plain `read_exact` would collapse clean EOF and truncated prefix into
-        // the same error. This loop keeps those cases distinct.
-        let read = reader
-            .read(&mut prefix[offset..])
-            .map_err(|source| TransportError::Io {
-                operation: "read frame length",
-                source,
-            })?;
+        while offset < prefix.len() {
+            // Plain `read_exact` would collapse clean EOF and truncated prefix into
+            // the same error. This loop keeps those cases distinct.
+            let read =
+                self.reader
+                    .read(&mut prefix[offset..])
+                    .map_err(|source| TransportError::Io {
+                        operation: "read frame length",
+                        source,
+                    })?;
 
-        if read == 0 {
-            if offset == 0 {
-                return Ok(None);
+            if read == 0 {
+                if offset == 0 {
+                    return Ok(None);
+                }
+
+                return Err(TransportError::UnexpectedEof {
+                    operation: "read frame length",
+                });
             }
 
-            return Err(TransportError::UnexpectedEof {
-                operation: "read frame length",
-            });
+            offset += read;
         }
 
-        offset += read;
+        Ok(Some(prefix))
     }
-
-    Ok(Some(prefix))
 }
 
 #[cfg(test)]

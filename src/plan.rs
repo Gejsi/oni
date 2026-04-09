@@ -13,7 +13,7 @@ pub struct PlanOptions {
     pub delete_extraneous: bool,
 }
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq, Clone, Copy)]
 pub enum Operation {
     /// Destination path does not exist yet.
     Create { source_index: usize },
@@ -39,6 +39,24 @@ pub enum Operation {
 }
 
 impl Operation {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Create { .. } => "create",
+            Self::UpdateData { .. } => "update-data",
+            Self::UpdateMetadata { .. } => "update-metadata",
+            Self::Delete { .. } => "delete",
+            Self::Skip { .. } => "skip",
+        }
+    }
+}
+
+impl std::fmt::Display for Operation {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+impl Operation {
     fn classify_matched_entries(
         source: &ManifestEntry,
         destination: &ManifestEntry,
@@ -56,8 +74,8 @@ impl Operation {
         }
 
         // Equal length does not prove equal contents. The planner intentionally
-        // stays cheap and metadata-based; the session layer can pay for `--checksum`
-        // verification when the user explicitly asks for it.
+        // stays cheap and metadata-based; the session layer can choose whether
+        // to pay for content verification after this metadata decision.
         if source.metadata == destination.metadata {
             Self::Skip {
                 source_index,

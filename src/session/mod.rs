@@ -5,19 +5,15 @@
 //! public request type small and transport-agnostic.
 
 mod local;
-mod preview;
 
 use std::fmt;
+use std::path::Path;
 
 use crate::error::{PathError, SessionError};
 use crate::path::{parse_endpoint, Endpoint};
-
-pub use preview::{Change, ChangeKind, Preview, Summary};
+use crate::plan::PlanOptions;
 
 /// A parsed sync request.
-///
-/// This type stays intentionally small: it owns parsed endpoints and user
-/// options, then dispatches into the currently available backend.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Request {
     pub source: Endpoint,
@@ -43,38 +39,15 @@ impl Request {
         }
     }
 
-    pub fn preview(&self) -> Result<Preview, SessionError> {
-        if !self.options.dry_run {
-            return self.apply();
-        }
-
-        let operations = match (&self.source, &self.destination) {
-            // Keep the local-only preview path isolated so its filesystem
-            // assumptions do not spread into the future SSH-backed session.
+    pub fn apply(
+        &self,
+        mut on_operation: impl FnMut(crate::plan::Operation, &Path),
+    ) -> Result<(), SessionError> {
+        match (&self.source, &self.destination) {
             (Endpoint::Local(source), Endpoint::Local(destination)) => {
-                local::preview(source, destination, &self.options)?
+                local::apply(source, destination, &self.options, &mut on_operation)
             }
-            _ => return Err(self.unsupported_mode()),
-        };
-
-        Ok(self.finish(operations))
-    }
-
-    pub fn apply(&self) -> Result<Preview, SessionError> {
-        let operations = match (&self.source, &self.destination) {
-            (Endpoint::Local(source), Endpoint::Local(destination)) => {
-                local::apply(source, destination, &self.options)?
-            }
-            _ => return Err(self.unsupported_mode()),
-        };
-
-        Ok(self.finish(operations))
-    }
-
-    fn finish(&self, operations: Vec<Change>) -> Preview {
-        Preview {
-            mode: self.mode(),
-            operations,
+            _ => Err(self.unsupported_mode()),
         }
     }
 
@@ -87,27 +60,17 @@ impl Request {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Options {
-    pub dry_run: bool,
-    pub delete_extraneous: bool,
-    pub checksum: bool,
-    pub verbose: u8,
+    pub plan: PlanOptions,
     pub strategy: Strategy,
     pub chunker: Chunker,
-    pub stats: bool,
-    pub benchmark_tag: Option<String>,
 }
 
 impl Default for Options {
     fn default() -> Self {
         Self {
-            dry_run: false,
-            delete_extraneous: false,
-            checksum: false,
-            verbose: 0,
+            plan: PlanOptions::default(),
             strategy: Strategy::Auto,
             chunker: Chunker::FastCdc,
-            stats: false,
-            benchmark_tag: None,
         }
     }
 }

@@ -61,8 +61,8 @@ pub struct DeltaStats {
 
 /// Destination for source-side CDC decisions.
 ///
-/// `reference()` means "reuse this span from the basis file"; `literal()`
-/// means "write these source bytes directly".
+/// `reference()` means "reuse this span from the basis file";
+/// `literal()` means "write these source bytes directly".
 pub trait DeltaSink {
     fn literal(&mut self, bytes: &[u8]) -> Result<(), StrategyError>;
     fn reference(&mut self, offset: u64, len: usize) -> Result<(), StrategyError>;
@@ -383,7 +383,7 @@ mod tests {
     fn equal_size_overwrites_still_rebuild_the_source() {
         let basis_bytes = patterned_bytes(192 * 1024);
         let mut source_bytes = basis_bytes.clone();
-        source_bytes[64 * 1024..64 * 1024 + 18].copy_from_slice(b"replacement-bytes!");
+        source_bytes[64 * 1024..64 * 1024 + 17].copy_from_slice(b"replacement-bytes");
         let config = FastCdcConfig::default();
 
         let signatures = signatures_fastcdc(&mut Cursor::new(&basis_bytes), config).unwrap();

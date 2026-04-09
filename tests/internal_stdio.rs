@@ -12,8 +12,7 @@ use oni::transport::stdio::Connection;
 fn internal_stdio_helper_completes_a_hello_handshake() {
     let mut child = Command::new(env!("CARGO_BIN_EXE_oni"))
         .arg("internal")
-        .arg("serve")
-        .arg("--stdio")
+        .arg("serve-stdio")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::inherit())

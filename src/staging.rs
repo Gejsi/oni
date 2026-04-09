@@ -1,4 +1,4 @@
-//! Small filesystem helpers for the local executor.
+//! Small filesystem helpers.
 //!
 //! This file owns the crash-safe write path and the follow-up cleanup around
 //! deletes so session orchestration can stay small and readable.
@@ -27,6 +27,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::SessionError;
 
+// Temp-file names need a process-wide unique suffix because multiple staging
+// operations may run concurrently in different threads. An atomic counter keeps
+// that uniqueness cheap without forcing a mutex into the hot path.
 static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 /// Replace `destination` with the contents and basic metadata from `source`.
@@ -58,7 +61,7 @@ pub fn replace_with_writer(
     destination: &Path,
     write_contents: impl FnOnce(&mut File) -> Result<(), SessionError>,
 ) -> Result<(), SessionError> {
-    // The executor hands us a writer closure so strategy code can stream bytes
+    // The caller provides a writer closure so strategy code can stream bytes
     // into a temp file without knowing anything about temp-file naming, rename
     // rules, or parent-directory syncing.
     let parent = parent_directory(destination);

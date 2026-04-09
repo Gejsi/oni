@@ -56,7 +56,6 @@ fn syncs_directory_updates_and_deletes_through_the_cli() {
 
     let output = Command::new(env!("CARGO_BIN_EXE_oni"))
         .arg("--delete")
-        .arg("--stats")
         .arg(&source)
         .arg(&destination)
         .output()
@@ -72,10 +71,6 @@ fn syncs_directory_updates_and_deletes_through_the_cli() {
         b"keep"
     );
     assert!(!destination.join("nested/remove.txt").exists());
-
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("summary\tupdate-data=1"));
-    assert!(stdout.contains("summary\tdelete=1"));
 
     fs::remove_dir_all(source).unwrap();
     fs::remove_dir_all(destination).unwrap();
@@ -98,7 +93,6 @@ fn applies_fastcdc_strategy_through_the_cli() {
     let output = Command::new(env!("CARGO_BIN_EXE_oni"))
         .arg("--strategy")
         .arg("cdc")
-        .arg("--stats")
         .arg(&source)
         .arg(&destination)
         .output()
@@ -106,9 +100,6 @@ fn applies_fastcdc_strategy_through_the_cli() {
 
     assert!(output.status.success());
     assert_eq!(fs::read(&destination).unwrap(), source_bytes);
-
-    let stdout = String::from_utf8(output.stdout).unwrap();
-    assert!(stdout.contains("summary\tupdate-data=1"));
 
     fs::remove_dir_all(root).unwrap();
 }

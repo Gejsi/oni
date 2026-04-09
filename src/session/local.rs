@@ -1,127 +1,82 @@
-//! Local-only session backend for the current `v2` implementation.
+//! Local-only apply backend.
 //!
-//! The file stays intentionally small:
-//! - prepare manifests
-//! - stream planned operations
-//! - execute local filesystem changes
-//! - translate operations into user-facing preview output
+//! This file intentionally owns one flow only:
+//! - scan source and destination
+//! - stream planner operations
+//! - refine same-size matches by comparing bytes
+//! - execute the final operation
+//! - emit the final operation to the caller
 //!
-//! Current local pipeline:
-//!
-//!   CLI request
-//!       |
-//!       v
-//!   scan source manifest -------------------+
-//!       |                                  |
-//!       v                                  v
-//!   resolve/scan destination manifest   stream metadata-only plan
-//!       |                                  |
-//!       +--------------+-------------------+
-//!                      |
-//!                      v
-//!        verify equal-size matches when needed
-//!                      |
-//!                      v
-//!          consume each operation immediately
-//!            as preview output or real apply
+//! There is one execution flow only. Any future non-applying mode should be
+//! built as its own clean flow instead of leaking optional branches into the
+//! real executor.
 
 use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
 use crate::error::SessionError;
-use crate::staging;
 use crate::manifest::{Manifest, ManifestRoot};
 use crate::path::LocalEndpoint;
-use crate::plan::{Operation, PlanOptions, for_each_operation};
+use crate::plan::{for_each_operation, Operation};
+use crate::staging;
 use crate::strategy::cdc;
 
-use super::{Change, ChangeKind, Options};
+use super::Options;
 
-/// Temporary local preview backend.
-///
-/// Keeping this logic out of `session::mod` makes the current limitation
-/// explicit: only local dry-run planning exists today, while the main session
-/// type stays transport-agnostic enough for the future SSH helper path.
-pub(super) fn preview(
+pub fn apply(
     source: &LocalEndpoint,
     destination: &LocalEndpoint,
     options: &Options,
-) -> Result<Vec<Change>, SessionError> {
-    let prepared = prepare(source, destination)?;
-    let plan_options = PlanOptions {
-        delete_extraneous: options.delete_extraneous,
-    };
-    build_changes(
-        source,
-        destination,
-        &prepared.source_manifest,
-        prepared.destination_manifest.as_ref(),
-        options.checksum,
-        plan_options,
-    )
-}
-
-pub(super) fn apply(
-    source: &LocalEndpoint,
-    destination: &LocalEndpoint,
-    options: &Options,
-) -> Result<Vec<Change>, SessionError> {
-    // Real execution must be correct even when the user did not ask dry-run to
-    // pay for `--checksum`, so the local apply path always verifies matched
-    // same-size files before deciding they are metadata-only or skipped.
-    let prepared = prepare(source, destination)?;
-    let plan_options = PlanOptions {
-        delete_extraneous: options.delete_extraneous,
-    };
-    let changes = build_changes(
-        source,
-        destination,
-        &prepared.source_manifest,
-        prepared.destination_manifest.as_ref(),
-        true,
-        plan_options,
-    )?;
-
-    execute_plan(
-        source,
-        destination,
-        &prepared.source_manifest,
-        prepared.destination_manifest.as_ref(),
-        plan_options,
-        options,
-    )?;
-
-    Ok(changes)
-}
-
-struct PreparedPlan {
-    source_manifest: Manifest,
-    destination_manifest: Option<Manifest>,
-}
-
-#[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
-struct VerificationStats {
-    compared_files: usize,
-    promoted_to_data: usize,
-    compared_bytes: u64,
-}
-
-fn prepare(source: &LocalEndpoint, destination: &LocalEndpoint) -> Result<PreparedPlan, SessionError> {
-    // The local backend always starts from the same metadata snapshot:
-    //
-    // 1. scan source
-    // 2. scan/resolve destination
-    //
-    // Planning is now streamed later at the point of preview/execution instead
-    // of being buffered here as a second owned `Vec<Operation>`.
+    mut on_operation: impl FnMut(Operation, &Path),
+) -> Result<(), SessionError> {
     let source_manifest = Manifest::scan(&source.path)?;
     let destination_manifest = scan_destination_manifest(source, destination, &source_manifest)?;
+    let mut execution_error = None;
 
-    Ok(PreparedPlan {
-        source_manifest,
-        destination_manifest,
-    })
+    for_each_operation(
+        &source_manifest,
+        destination_manifest.as_ref(),
+        options.plan,
+        |planned| {
+            if execution_error.is_some() {
+                return Ok(());
+            }
+
+            match apply_operation(
+                source,
+                destination,
+                &source_manifest,
+                destination_manifest.as_ref(),
+                planned,
+                options,
+            ) {
+                Ok(operation) => {
+                    if let Err(error) = with_operation_path(
+                        source,
+                        destination,
+                        &source_manifest,
+                        destination_manifest.as_ref(),
+                        operation,
+                        |path| on_operation(operation, path),
+                    ) {
+                        execution_error = Some(error);
+                    }
+                    Ok(())
+                }
+                Err(error) => {
+                    execution_error = Some(error);
+                    Ok(())
+                }
+            }
+        },
+    )?;
+
+    if let Some(error) = execution_error {
+        Err(error)
+    } else {
+        Ok(())
+    }
 }
 
 fn scan_destination_manifest(
@@ -150,58 +105,22 @@ fn scan_destination_manifest(
     }
 }
 
-fn execute_plan(
+fn apply_operation(
     source: &LocalEndpoint,
     destination: &LocalEndpoint,
     source_manifest: &Manifest,
     destination_manifest: Option<&Manifest>,
-    plan_options: PlanOptions,
+    planned: Operation,
     options: &Options,
-) -> Result<(), SessionError> {
-    // The local executor keeps one simple rule: consume planned operations in
-    // order, and make each file change crash-safe via `staging.rs`.
-    let mut execution_error: Option<SessionError> = None;
-
-    for_each_verified_operation(
+) -> Result<Operation, SessionError> {
+    let operation = refine_operation(
         source,
         destination,
         source_manifest,
         destination_manifest,
-        true,
-        plan_options,
-        |operation| {
-            if execution_error.is_some() {
-                return;
-            }
-
-            if let Err(error) = execute_operation(
-                source,
-                destination,
-                source_manifest,
-                destination_manifest,
-                operation,
-                options,
-            ) {
-                execution_error = Some(error);
-            }
-        },
+        planned,
     )?;
 
-    if let Some(error) = execution_error {
-        Err(error)
-    } else {
-        Ok(())
-    }
-}
-
-fn execute_operation(
-    source: &LocalEndpoint,
-    destination: &LocalEndpoint,
-    source_manifest: &Manifest,
-    destination_manifest: Option<&Manifest>,
-    operation: Operation,
-    options: &Options,
-) -> Result<(), SessionError> {
     match operation {
         Operation::Create { source_index } => {
             let (source_path, destination_path) =
@@ -251,7 +170,47 @@ fn execute_operation(
         Operation::Skip { .. } => {}
     }
 
-    Ok(())
+    Ok(operation)
+}
+
+fn refine_operation(
+    source: &LocalEndpoint,
+    destination: &LocalEndpoint,
+    source_manifest: &Manifest,
+    destination_manifest: Option<&Manifest>,
+    operation: Operation,
+) -> Result<Operation, SessionError> {
+    match operation {
+        Operation::Skip {
+            source_index,
+            destination_index,
+        }
+        | Operation::UpdateMetadata {
+            source_index,
+            destination_index,
+        } => {
+            let (source_path, destination_path) = matched_operation_paths(
+                source,
+                destination,
+                source_manifest,
+                destination_manifest.ok_or(SessionError::MissingDestinationManifest)?,
+                source_index,
+                destination_index,
+            )?;
+
+            if files_match(&source_path, &destination_path)? {
+                Ok(operation)
+            } else {
+                Ok(Operation::UpdateData {
+                    source_index,
+                    destination_index,
+                })
+            }
+        }
+        Operation::Create { .. } | Operation::UpdateData { .. } | Operation::Delete { .. } => {
+            Ok(operation)
+        }
+    }
 }
 
 fn apply_data_update(
@@ -259,15 +218,6 @@ fn apply_data_update(
     destination_path: &Path,
     options: &Options,
 ) -> Result<(), SessionError> {
-    // Strategy dispatch stays here instead of in `staging.rs` so the filesystem
-    // helpers remain dumb and reusable.
-    //
-    // `Auto` is intentionally conservative today:
-    //
-    //   Auto -> Whole
-    //        -> Cdc only when the user asks explicitly
-    //
-    // The real heuristic selector belongs here later.
     match options.strategy {
         super::Strategy::Auto | super::Strategy::Whole => {
             staging::replace_file(source_path, destination_path)
@@ -299,10 +249,6 @@ fn apply_fastcdc_delta_update(
     //   destination --chunk_read--> chunk bytes --hash--> basis signatures
     //   source      --chunk_read--> chunk bytes --match--> reference/literal sink
     //   sink + destination basis ------------------------> temp file -> rename
-    //
-    // The important simplification here is that the source pass now streams
-    // directly into the temp-file writer. Only the basis-signature table stays
-    // buffered for the file.
     let config = cdc::FastCdcConfig::default();
 
     let mut basis_signature_file =
@@ -339,60 +285,56 @@ fn apply_fastcdc_delta_update(
     Ok(())
 }
 
-fn build_changes(
+fn with_operation_path(
     source: &LocalEndpoint,
     destination: &LocalEndpoint,
     source_manifest: &Manifest,
     destination_manifest: Option<&Manifest>,
-    verify_contents: bool,
-    plan_options: PlanOptions,
-) -> Result<Vec<Change>, SessionError> {
-    // Preview/apply output uses logical destination paths, not internal manifest
-    // indices, so the CLI can print one stable path per operation.
-    let mut changes = Vec::new();
-
+    operation: Operation,
+    mut on_path: impl FnMut(&Path),
+) -> Result<(), SessionError> {
     match source_manifest.root {
-        ManifestRoot::Directory => {
-            for_each_verified_operation(
-                source,
-                destination,
-                source_manifest,
-                destination_manifest,
-                verify_contents,
-                plan_options,
-                |operation| {
-                    changes.push(Change {
-                        kind: ChangeKind::from(&operation),
-                        path: directory_change_path(
-                            source_manifest,
-                            destination_manifest,
-                            &operation,
-                        )
-                        .expect("directory change path should be derivable"),
-                    });
-                },
-            )?;
-        }
+        ManifestRoot::Directory => on_path(directory_operation_path(
+            source_manifest,
+            destination_manifest,
+            operation,
+        )?),
         ManifestRoot::File => {
             let target_path = resolve_file_target(source, destination)?;
-            for_each_verified_operation(
-                source,
-                destination,
-                source_manifest,
-                destination_manifest,
-                verify_contents,
-                plan_options,
-                |operation| {
-                    changes.push(Change {
-                        kind: ChangeKind::from(&operation),
-                        path: target_path.clone(),
-                    });
-                },
-            )?;
+            on_path(&target_path);
         }
     }
 
-    Ok(changes)
+    Ok(())
+}
+
+fn directory_operation_path<'a>(
+    source_manifest: &'a Manifest,
+    destination_manifest: Option<&'a Manifest>,
+    operation: Operation,
+) -> Result<&'a Path, SessionError> {
+    match operation {
+        Operation::Create { source_index }
+        | Operation::UpdateData {
+            source_index,
+            destination_index: _,
+        }
+        | Operation::UpdateMetadata {
+            source_index,
+            destination_index: _,
+        }
+        | Operation::Skip {
+            source_index,
+            destination_index: _,
+        } => Ok(source_manifest.entries[source_index].path.as_path()),
+        Operation::Delete { destination_index } => Ok(
+            destination_manifest
+                .ok_or(SessionError::MissingDestinationManifest)?
+                .entries[destination_index]
+                .path
+                .as_path(),
+        ),
+    }
 }
 
 fn create_operation_paths(
@@ -416,30 +358,41 @@ fn create_operation_paths(
     }
 }
 
-fn directory_change_path(
+fn matched_operation_paths(
+    source: &LocalEndpoint,
+    destination: &LocalEndpoint,
     source_manifest: &Manifest,
-    destination_manifest: Option<&Manifest>,
-    operation: &Operation,
+    destination_manifest: &Manifest,
+    source_index: usize,
+    destination_index: usize,
+) -> Result<(PathBuf, PathBuf), SessionError> {
+    match source_manifest.root {
+        ManifestRoot::Directory => Ok((
+            source
+                .path
+                .join(&source_manifest.entries[source_index].path),
+            destination
+                .path
+                .join(&destination_manifest.entries[destination_index].path),
+        )),
+        ManifestRoot::File => Ok((
+            source.path.clone(),
+            resolve_file_target(source, destination)?,
+        )),
+    }
+}
+
+fn delete_operation_path(
+    source: &LocalEndpoint,
+    destination: &LocalEndpoint,
+    destination_manifest: &Manifest,
+    destination_index: usize,
 ) -> Result<PathBuf, SessionError> {
-    match *operation {
-        Operation::Create { source_index }
-        | Operation::UpdateData {
-            source_index,
-            destination_index: _,
-        }
-        | Operation::UpdateMetadata {
-            source_index,
-            destination_index: _,
-        }
-        | Operation::Skip {
-            source_index,
-            destination_index: _,
-        } => Ok(source_manifest.entries[source_index].path.clone()),
-        Operation::Delete { destination_index } => Ok(destination_manifest
-            .ok_or(SessionError::MissingDestinationManifest)?
-            .entries[destination_index]
+    match destination_manifest.root {
+        ManifestRoot::Directory => Ok(destination
             .path
-            .clone()),
+            .join(&destination_manifest.entries[destination_index].path)),
+        ManifestRoot::File => resolve_file_target(source, destination),
     }
 }
 
@@ -463,163 +416,16 @@ fn resolve_file_target(
     Ok(destination.path.clone())
 }
 
-fn for_each_verified_operation(
-    source: &LocalEndpoint,
-    destination: &LocalEndpoint,
-    source_manifest: &Manifest,
-    destination_manifest: Option<&Manifest>,
-    verify_contents: bool,
-    plan_options: PlanOptions,
-    mut on_operation: impl FnMut(Operation),
-) -> Result<VerificationStats, SessionError> {
-    let mut callback_error = None;
-    let mut stats = VerificationStats::default();
-
-    // Equal-size matches take this refinement path:
-    //
-    //   planner metadata guess
-    //       Skip / UpdateMetadata
-    //               |
-    //               v
-    //        streaming byte compare
-    //         |                 |
-    //         v                 v
-    //      contents same    contents differ
-    //         |                 |
-    //         v                 v
-    //   keep original op   upgrade to UpdateData
-    //
-    // The planner stays pure and metadata-based. `--checksum` is intentionally
-    // a session-level opt-in because it performs real I/O and should not be
-    // the planner's default cost.
-    for_each_operation(
-        source_manifest,
-        destination_manifest,
-        plan_options,
-        |operation| {
-            if callback_error.is_some() {
-                return Ok(());
-            }
-
-            match verify_operation(
-                source,
-                destination,
-                source_manifest,
-                destination_manifest,
-                operation,
-                verify_contents,
-                &mut stats,
-            ) {
-                Ok(operation) => {
-                    on_operation(operation);
-                    Ok(())
-                }
-                Err(error) => {
-                    callback_error = Some(error);
-                    Ok(())
-                }
-            }
-        },
-    )
-    .map_err(SessionError::from)?;
-
-    if let Some(error) = callback_error {
-        return Err(error);
-    }
-
-    Ok(stats)
-}
-
-fn verify_operation(
-    source: &LocalEndpoint,
-    destination: &LocalEndpoint,
-    source_manifest: &Manifest,
-    destination_manifest: Option<&Manifest>,
-    operation: Operation,
-    verify_contents: bool,
-    stats: &mut VerificationStats,
-) -> Result<Operation, SessionError> {
-    match operation {
-        Operation::Skip {
-            source_index,
-            destination_index,
-        }
-        | Operation::UpdateMetadata {
-            source_index,
-            destination_index,
-        } if verify_contents => {
-            let (source_path, destination_path) = matched_operation_paths(
-                source,
-                destination,
-                source_manifest,
-                destination_manifest.ok_or(SessionError::MissingDestinationManifest)?,
-                source_index,
-                destination_index,
-            )?;
-            let compared_bytes = source_manifest.entries[source_index].metadata.len;
-            let contents_match = files_match(&source_path, &destination_path)?;
-            stats.compared_files += 1;
-            stats.compared_bytes += compared_bytes;
-
-            if contents_match {
-                Ok(operation)
-            } else {
-                stats.promoted_to_data += 1;
-                Ok(Operation::UpdateData {
-                    source_index,
-                    destination_index,
-                })
-            }
-        }
-        _ => Ok(operation),
-    }
-}
-
-fn matched_operation_paths(
-    source: &LocalEndpoint,
-    destination: &LocalEndpoint,
-    source_manifest: &Manifest,
-    destination_manifest: &Manifest,
-    source_index: usize,
-    destination_index: usize,
-) -> Result<(PathBuf, PathBuf), SessionError> {
-    // Directory roots compare relative paths inside each root.
-    // File roots compare exactly one logical source/destination item.
-    match source_manifest.root {
-        ManifestRoot::Directory => Ok((
-            source.path.join(&source_manifest.entries[source_index].path),
-            destination
-                .path
-                .join(&destination_manifest.entries[destination_index].path),
-        )),
-        ManifestRoot::File => Ok((source.path.clone(), resolve_file_target(source, destination)?)),
-    }
-}
-
-fn delete_operation_path(
-    source: &LocalEndpoint,
-    destination: &LocalEndpoint,
-    destination_manifest: &Manifest,
-    destination_index: usize,
-) -> Result<PathBuf, SessionError> {
-    match destination_manifest.root {
-        ManifestRoot::Directory => Ok(destination
-            .path
-            .join(&destination_manifest.entries[destination_index].path)),
-        ManifestRoot::File => resolve_file_target(source, destination),
-    }
-}
-
 fn files_match(source: &Path, destination: &Path) -> Result<bool, SessionError> {
-    // This is a streaming byte comparison, not a hashing pass. It is used only
-    // when the session explicitly needs content verification for equal-size
-    // matches.
-    let mut source_file = File::open(source).map_err(|source_error| SessionError::ChecksumIo {
+    // This is the correctness guard for same-size matches. If metadata says two
+    // files look identical, Oni still compares bytes before deciding that an
+    // update can be skipped or reduced to metadata-only work.
+    let mut source_file = File::open(source).map_err(|source_error| SessionError::VerifyIo {
         path: source.to_path_buf(),
         source: source_error,
     })?;
     let mut destination_file =
-        File::open(destination).map_err(|source_error| SessionError::ChecksumIo {
+        File::open(destination).map_err(|source_error| SessionError::VerifyIo {
             path: destination.to_path_buf(),
             source: source_error,
         })?;
@@ -629,14 +435,14 @@ fn files_match(source: &Path, destination: &Path) -> Result<bool, SessionError> 
     loop {
         let source_read = source_file
             .read(&mut source_buffer)
-            .map_err(|source_error| SessionError::ChecksumIo {
+            .map_err(|source_error| SessionError::VerifyIo {
                 path: source.to_path_buf(),
                 source: source_error,
             })?;
         let destination_read =
             destination_file
                 .read(&mut destination_buffer)
-                .map_err(|source_error| SessionError::ChecksumIo {
+                .map_err(|source_error| SessionError::VerifyIo {
                     path: destination.to_path_buf(),
                     source: source_error,
                 })?;
@@ -659,140 +465,12 @@ fn files_match(source: &Path, destination: &Path) -> Result<bool, SessionError> 
 mod tests {
     use std::fs;
     use std::fs::File;
-    use std::path::PathBuf;
-    use std::thread;
     use std::time::{Duration, UNIX_EPOCH};
 
     use crate::error::SessionError;
     use crate::path::temp_path;
+    use crate::plan::PlanOptions;
     use crate::session::{Chunker, Options, Request, Strategy};
-
-    #[test]
-    fn previews_directory_work_for_local_paths() {
-        let source = temp_path("session-source-dir");
-        let destination = temp_path("session-destination-dir");
-
-        fs::create_dir_all(source.join("nested")).unwrap();
-        fs::create_dir_all(&destination).unwrap();
-        fs::write(source.join("nested/new.txt"), b"new").unwrap();
-        fs::write(destination.join("old.txt"), b"old").unwrap();
-
-        let request = Request::from_args(
-            &source.to_string_lossy(),
-            &destination.to_string_lossy(),
-            Options {
-                dry_run: true,
-                delete_extraneous: true,
-                checksum: false,
-                verbose: 0,
-                strategy: Strategy::Auto,
-                chunker: Chunker::FastCdc,
-                stats: false,
-                benchmark_tag: None,
-            },
-        )
-        .unwrap();
-
-        let preview = request.preview().unwrap();
-
-        assert_eq!(preview.operations.len(), 2);
-        assert_eq!(preview.operations[0].kind.to_string(), "create");
-        assert_eq!(preview.operations[0].path, PathBuf::from("nested/new.txt"));
-        assert_eq!(preview.operations[1].kind.to_string(), "delete");
-        assert_eq!(preview.operations[1].path, PathBuf::from("old.txt"));
-
-        fs::remove_dir_all(source).unwrap();
-        fs::remove_dir_all(destination).unwrap();
-    }
-
-    #[test]
-    fn previews_single_file_work_against_a_missing_destination_file() {
-        let root = temp_path("session-file-root");
-        fs::create_dir_all(&root).unwrap();
-
-        let source = root.join("alpha.txt");
-        let destination = root.join("beta.txt");
-        fs::write(&source, b"oni").unwrap();
-
-        let request = Request::from_args(
-            &source.to_string_lossy(),
-            &destination.to_string_lossy(),
-            Options {
-                dry_run: true,
-                ..Options::default()
-            },
-        )
-        .unwrap();
-
-        let preview = request.preview().unwrap();
-
-        assert_eq!(preview.operations.len(), 1);
-        assert_eq!(preview.operations[0].kind.to_string(), "create");
-        assert_eq!(preview.operations[0].path, destination);
-
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn checksum_promotes_metadata_only_file_updates_to_data_updates() {
-        let root = temp_path("session-checksum-data-update");
-        fs::create_dir_all(&root).unwrap();
-
-        let source = root.join("alpha.txt");
-        let destination = root.join("beta.txt");
-        fs::write(&source, b"aaa").unwrap();
-        fs::write(&destination, b"bbb").unwrap();
-
-        let request = Request::from_args(
-            &source.to_string_lossy(),
-            &destination.to_string_lossy(),
-            Options {
-                dry_run: true,
-                checksum: true,
-                ..Options::default()
-            },
-        )
-        .unwrap();
-
-        let preview = request.preview().unwrap();
-
-        assert_eq!(preview.operations.len(), 1);
-        assert_eq!(preview.operations[0].kind.to_string(), "update-data");
-        assert_eq!(preview.operations[0].path, destination);
-
-        fs::remove_dir_all(root).unwrap();
-    }
-
-    #[test]
-    fn checksum_preserves_metadata_only_updates_when_contents_match() {
-        let root = temp_path("session-checksum-metadata-update");
-        fs::create_dir_all(&root).unwrap();
-
-        let source = root.join("alpha.txt");
-        let destination = root.join("beta.txt");
-        fs::write(&source, b"oni").unwrap();
-        thread::sleep(Duration::from_secs(1));
-        fs::write(&destination, b"oni").unwrap();
-
-        let request = Request::from_args(
-            &source.to_string_lossy(),
-            &destination.to_string_lossy(),
-            Options {
-                dry_run: true,
-                checksum: true,
-                ..Options::default()
-            },
-        )
-        .unwrap();
-
-        let preview = request.preview().unwrap();
-
-        assert_eq!(preview.operations.len(), 1);
-        assert_eq!(preview.operations[0].kind.to_string(), "update-metadata");
-        assert_eq!(preview.operations[0].path, destination);
-
-        fs::remove_dir_all(root).unwrap();
-    }
 
     #[test]
     fn applies_single_file_create_and_preserves_contents() {
@@ -809,19 +487,22 @@ mod tests {
             Options::default(),
         )
         .unwrap();
+        let mut operations = Vec::new();
 
-        let applied = request.apply().unwrap();
+        request
+            .apply(|operation, path| operations.push((operation.to_string(), path.to_path_buf())))
+            .unwrap();
 
-        assert_eq!(applied.operations.len(), 1);
-        assert_eq!(applied.operations[0].kind.to_string(), "create");
-        assert_eq!(applied.operations[0].path, destination);
+        assert_eq!(operations.len(), 1);
+        assert_eq!(operations[0].0, "create");
+        assert_eq!(operations[0].1, destination);
         assert_eq!(fs::read(&destination).unwrap(), b"oni");
 
         fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
-    fn applies_equal_size_changed_files_even_without_checksum_flag() {
+    fn upgrades_same_size_changed_files_to_data_updates() {
         let root = temp_path("session-apply-same-size");
         fs::create_dir_all(&root).unwrap();
 
@@ -836,11 +517,14 @@ mod tests {
             Options::default(),
         )
         .unwrap();
+        let mut operations = Vec::new();
 
-        let applied = request.apply().unwrap();
+        request
+            .apply(|operation, path| operations.push((operation.to_string(), path.to_path_buf())))
+            .unwrap();
 
-        assert_eq!(applied.operations.len(), 1);
-        assert_eq!(applied.operations[0].kind.to_string(), "update-data");
+        assert_eq!(operations.len(), 1);
+        assert_eq!(operations[0].0, "update-data");
         assert_eq!(fs::read(&destination).unwrap(), b"aaa");
 
         fs::remove_dir_all(root).unwrap();
@@ -872,11 +556,14 @@ mod tests {
             },
         )
         .unwrap();
+        let mut operations = Vec::new();
 
-        let applied = request.apply().unwrap();
+        request
+            .apply(|operation, path| operations.push((operation.to_string(), path.to_path_buf())))
+            .unwrap();
 
-        assert_eq!(applied.operations.len(), 1);
-        assert_eq!(applied.operations[0].kind.to_string(), "update-data");
+        assert_eq!(operations.len(), 1);
+        assert_eq!(operations[0].0, "update-data");
         assert_eq!(fs::read(&destination).unwrap(), source_bytes);
 
         fs::remove_dir_all(root).unwrap();
@@ -903,7 +590,7 @@ mod tests {
         )
         .unwrap();
 
-        let error = request.apply().unwrap_err();
+        let error = request.apply(|_, _| {}).unwrap_err();
 
         assert!(matches!(
             error,
@@ -945,11 +632,14 @@ mod tests {
             Options::default(),
         )
         .unwrap();
+        let mut operations = Vec::new();
 
-        let applied = request.apply().unwrap();
+        request
+            .apply(|operation, path| operations.push((operation.to_string(), path.to_path_buf())))
+            .unwrap();
 
-        assert_eq!(applied.operations.len(), 1);
-        assert_eq!(applied.operations[0].kind.to_string(), "update-metadata");
+        assert_eq!(operations.len(), 1);
+        assert_eq!(operations[0].0, "update-metadata");
         assert_eq!(fs::read(&destination).unwrap(), b"oni");
 
         let destination_modified = fs::metadata(&destination).unwrap().modified().unwrap();
@@ -980,15 +670,24 @@ mod tests {
             &source.to_string_lossy(),
             &destination.to_string_lossy(),
             Options {
-                delete_extraneous: true,
+                plan: PlanOptions {
+                    delete_extraneous: true,
+                },
                 ..Options::default()
             },
         )
         .unwrap();
+        let mut delete_count = 0;
 
-        let applied = request.apply().unwrap();
+        request
+            .apply(|operation, _| {
+                if matches!(operation, crate::plan::Operation::Delete { .. }) {
+                    delete_count += 1;
+                }
+            })
+            .unwrap();
 
-        assert_eq!(applied.summary().delete, 1);
+        assert_eq!(delete_count, 1);
         assert!(!destination.join("remove.txt").exists());
         assert!(destination.join("keep.txt").exists());
 
@@ -1008,17 +707,54 @@ mod tests {
             &source.to_string_lossy(),
             &destination.to_string_lossy(),
             Options {
-                delete_extraneous: true,
+                plan: PlanOptions {
+                    delete_extraneous: true,
+                },
                 ..Options::default()
             },
         )
         .unwrap();
+        let mut delete_count = 0;
 
-        let applied = request.apply().unwrap();
+        request
+            .apply(|operation, _| {
+                if matches!(operation, crate::plan::Operation::Delete { .. }) {
+                    delete_count += 1;
+                }
+            })
+            .unwrap();
 
-        assert_eq!(applied.summary().delete, 1);
+        assert_eq!(delete_count, 1);
         assert!(destination.exists());
         assert!(!destination.join("nested").exists());
+
+        fs::remove_dir_all(source).unwrap();
+        fs::remove_dir_all(destination).unwrap();
+    }
+
+    #[test]
+    fn reports_directory_changes_with_relative_paths() {
+        let source = temp_path("session-report-directory-source");
+        let destination = temp_path("session-report-directory-destination");
+        fs::create_dir_all(source.join("nested")).unwrap();
+        fs::create_dir_all(&destination).unwrap();
+        fs::write(source.join("nested/new.txt"), b"new").unwrap();
+
+        let request = Request::from_args(
+            &source.to_string_lossy(),
+            &destination.to_string_lossy(),
+            Options::default(),
+        )
+        .unwrap();
+        let mut operations = Vec::new();
+
+        request
+            .apply(|operation, path| operations.push((operation.to_string(), path.to_path_buf())))
+            .unwrap();
+
+        assert_eq!(operations.len(), 1);
+        assert_eq!(operations[0].0, "create");
+        assert_eq!(operations[0].1, std::path::PathBuf::from("nested/new.txt"));
 
         fs::remove_dir_all(source).unwrap();
         fs::remove_dir_all(destination).unwrap();

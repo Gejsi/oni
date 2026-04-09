@@ -1,97 +1,99 @@
-//! CLI surface for the `oni` binary.
+//! Flat CLI surface for the `oni` binary.
 //!
-//! The default command shape is `oni <SOURCE> <DESTINATION>`. Hidden
-//! subcommands exist only for internal helpers and debugging entry points.
+//! The command shape stays simple:
+//! - normal sync: `oni [OPTIONS] <SOURCE> <DESTINATION>`
+//! - internal helper mode: `oni internal <SUBCOMMAND>`
 
-use std::path::PathBuf;
+use clap::{Parser, Subcommand, ValueEnum};
 
-use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
-
+use crate::error::SessionError;
 use crate::session::{Chunker, Options, Strategy};
 
 #[derive(Parser, Debug)]
-#[command(
-    version,
-    about = "oni, a file synchronization tool",
-    subcommand_negates_reqs = true
-)]
+#[command(version, about = "oni, a file synchronization tool")]
 pub struct Cli {
-    #[command(subcommand)]
-    pub command: Option<Command>,
-
-    #[command(flatten)]
-    pub run: RunArgs,
-}
-
-#[derive(Subcommand, Debug)]
-pub enum Command {
-    #[command(hide = true)]
-    Manifest {
-        /// File or directory to scan
-        path: PathBuf,
-    },
-    #[command(hide = true)]
-    Internal(InternalCommand),
-}
-
-#[derive(Args, Debug, Clone, PartialEq, Eq)]
-pub struct RunArgs {
-    /// Show the planned operations without modifying the destination
-    #[arg(short = 'n', long = "dry-run")]
-    pub dry_run: bool,
-
-    /// Increase logging detail. Repeat for more verbosity.
-    #[arg(short = 'v', long = "verbose", action = ArgAction::Count)]
-    pub verbose: u8,
-
-    /// Delete destination entries that do not exist in the source
-    #[arg(long = "delete")]
+    /// Delete destination entries that do not exist in the source.
+    #[arg(long = "delete", alias = "del")]
     pub delete_extraneous: bool,
 
-    /// Force content verification instead of metadata-only planning
-    #[arg(long = "checksum")]
-    pub checksum: bool,
+    /// Always replace changed files wholesale.
+    #[arg(short = 'W', long = "whole-file", conflicts_with = "strategy")]
+    pub whole_file: bool,
 
-    /// Transfer strategy preference for later execution stages
-    #[arg(long = "strategy", value_enum, default_value_t = StrategyArg::Auto)]
-    pub strategy: StrategyArg,
+    /// Force the CDC delta path for changed files.
+    #[arg(long = "cdc", conflicts_with = "strategy")]
+    pub cdc: bool,
 
-    /// Chunker preference for later CDC-based execution stages
+    /// Transfer strategy preference for later execution stages.
+    #[arg(long = "strategy", value_enum)]
+    pub strategy: Option<StrategyArg>,
+
+    /// Chunker preference for later CDC-based execution stages.
     #[arg(long = "chunker", value_enum, default_value_t = ChunkerArg::FastCdc)]
     pub chunker: ChunkerArg,
 
-    /// Print a structured summary after the dry-run preview
-    #[arg(long = "stats")]
-    pub stats: bool,
-
-    /// Attach a benchmark label to this sync session
-    #[arg(long = "benchmark-tag")]
-    pub benchmark_tag: Option<String>,
+    #[command(subcommand)]
+    pub internal: Option<InternalCommand>,
 
     /// Source path. Remote endpoints use [user@]host:path.
-    #[arg(value_name = "SOURCE", required = true)]
+    #[arg(value_name = "SOURCE")]
     pub source: Option<String>,
 
     /// Destination path. Remote endpoints use [user@]host:path.
-    #[arg(value_name = "DESTINATION", required = true)]
+    #[arg(value_name = "DESTINATION")]
     pub destination: Option<String>,
 }
 
-impl RunArgs {
-    /// Convert raw CLI flags into the session-level options object used by the
-    /// rest of the codebase.
+impl Cli {
+    /// Convert CLI flags into the engine-level options object.
     pub fn options(&self) -> Options {
         Options {
-            dry_run: self.dry_run,
-            delete_extraneous: self.delete_extraneous,
-            checksum: self.checksum,
-            verbose: self.verbose,
-            strategy: self.strategy.into(),
+            plan: crate::plan::PlanOptions {
+                delete_extraneous: self.delete_extraneous,
+            },
+            strategy: self.strategy(),
             chunker: self.chunker.into(),
-            stats: self.stats,
-            benchmark_tag: self.benchmark_tag.clone(),
         }
     }
+
+    pub fn operands(&self) -> Result<(&str, &str), SessionError> {
+        let source = self
+            .source
+            .as_deref()
+            .ok_or(SessionError::MissingOperands)?;
+        let destination = self
+            .destination
+            .as_deref()
+            .ok_or(SessionError::MissingOperands)?;
+        Ok((source, destination))
+    }
+
+    fn strategy(&self) -> Strategy {
+        if self.whole_file {
+            return Strategy::Whole;
+        }
+
+        if self.cdc {
+            return Strategy::Cdc;
+        }
+
+        self.strategy.map(Into::into).unwrap_or(Strategy::Auto)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+pub enum InternalCommand {
+    #[command(name = "internal", hide = true)]
+    Internal {
+        #[command(subcommand)]
+        command: InternalSubcommand,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Subcommand)]
+pub enum InternalSubcommand {
+    #[command(name = "serve-stdio")]
+    ServeStdio,
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq, ValueEnum)]
@@ -130,70 +132,60 @@ impl From<ChunkerArg> for Chunker {
         }
     }
 }
-
-#[derive(Args, Debug)]
-pub struct InternalCommand {
-    #[command(subcommand)]
-    pub command: InternalSubcommand,
-}
-
-#[derive(Subcommand, Debug)]
-pub enum InternalSubcommand {
-    Serve(ServeCommand),
-}
-
-#[derive(Args, Debug)]
-pub struct ServeCommand {
-    /// Serve framed protocol messages over stdin/stdout.
-    #[arg(long)]
-    pub stdio: bool,
-}
-
 #[cfg(test)]
 mod tests {
     use clap::Parser;
 
-    use super::{ChunkerArg, Cli, Command, InternalSubcommand, StrategyArg};
+    use super::{ChunkerArg, Cli, InternalCommand, InternalSubcommand, StrategyArg};
+    use crate::session::Strategy;
 
     #[test]
     fn parses_default_copy_shape_with_early_flags() {
         let cli = Cli::try_parse_from([
             "oni",
-            "-n",
             "--delete",
             "--strategy",
             "cdc",
             "--chunker",
             "seqcdc",
-            "--stats",
-            "--benchmark-tag",
-            "nightly",
             "src",
             "dst",
         ])
         .unwrap();
 
-        assert!(cli.command.is_none());
-        assert!(cli.run.dry_run);
-        assert!(cli.run.delete_extraneous);
-        assert!(cli.run.stats);
-        assert_eq!(cli.run.strategy, StrategyArg::Cdc);
-        assert_eq!(cli.run.chunker, ChunkerArg::SeqCdc);
-        assert_eq!(cli.run.benchmark_tag.as_deref(), Some("nightly"));
-        assert_eq!(cli.run.source.as_deref(), Some("src"));
-        assert_eq!(cli.run.destination.as_deref(), Some("dst"));
+        assert!(cli.delete_extraneous);
+        assert!(cli.internal.is_none());
+        assert_eq!(cli.strategy, Some(StrategyArg::Cdc));
+        assert_eq!(cli.chunker, ChunkerArg::SeqCdc);
+        assert_eq!(cli.source.as_deref(), Some("src"));
+        assert_eq!(cli.destination.as_deref(), Some("dst"));
     }
 
     #[test]
-    fn parses_hidden_internal_stdio_shape() {
-        let cli = Cli::try_parse_from(["oni", "internal", "serve", "--stdio"]).unwrap();
+    fn parses_internal_stdio_helper_subcommand() {
+        let cli = Cli::try_parse_from(["oni", "internal", "serve-stdio"]).unwrap();
 
-        let Some(Command::Internal(command)) = cli.command else {
-            panic!("expected internal command");
-        };
+        assert_eq!(
+            cli.internal,
+            Some(InternalCommand::Internal {
+                command: InternalSubcommand::ServeStdio,
+            })
+        );
+        assert!(cli.source.is_none());
+        assert!(cli.destination.is_none());
+    }
 
-        match command.command {
-            InternalSubcommand::Serve(serve) => assert!(serve.stdio),
-        }
+    #[test]
+    fn whole_file_flag_overrides_default_strategy() {
+        let cli = Cli::try_parse_from(["oni", "--whole-file", "src", "dst"]).unwrap();
+
+        assert_eq!(cli.options().strategy, Strategy::Whole);
+    }
+
+    #[test]
+    fn cdc_flag_overrides_default_strategy() {
+        let cli = Cli::try_parse_from(["oni", "--cdc", "src", "dst"]).unwrap();
+
+        assert_eq!(cli.options().strategy, Strategy::Cdc);
     }
 }

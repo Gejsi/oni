@@ -27,8 +27,7 @@ impl Invocation {
                 "--".to_string(),
                 "oni".to_string(),
                 "internal".to_string(),
-                "serve".to_string(),
-                "--stdio".to_string(),
+                "serve-stdio".to_string(),
             ],
         }
     }
@@ -117,14 +116,7 @@ mod tests {
         assert_eq!(invocation.program, "ssh");
         assert_eq!(
             invocation.args,
-            vec![
-                "alice@example.com",
-                "--",
-                "oni",
-                "internal",
-                "serve",
-                "--stdio",
-            ]
+            vec!["alice@example.com", "--", "oni", "internal", "serve-stdio",]
         );
     }
 
@@ -139,7 +131,7 @@ mod tests {
 
         assert_eq!(
             invocation.args,
-            vec!["buildbox", "--", "oni", "internal", "serve", "--stdio",]
+            vec!["buildbox", "--", "oni", "internal", "serve-stdio",]
         );
     }
 

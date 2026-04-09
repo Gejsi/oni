@@ -191,8 +191,8 @@ pub enum SessionError {
     Strategy(#[from] StrategyError),
     #[error(transparent)]
     Chunker(#[from] ChunkerError),
-    #[error("failed to access file during checksum preview: {path}")]
-    ChecksumIo {
+    #[error("failed to access file during content verification: {path}")]
+    VerifyIo {
         path: PathBuf,
         #[source]
         source: io::Error,
@@ -210,7 +210,7 @@ pub enum SessionError {
     UnsupportedChunker { strategy: String, chunker: String },
     #[error("mode is not implemented yet: {mode}")]
     UnsupportedMode { mode: String },
-    #[error("cannot preview delete operations without a destination manifest")]
+    #[error("missing destination manifest for a matched or delete operation")]
     MissingDestinationManifest,
     #[error("source file does not have a file name: {path}")]
     MissingSourceName { path: PathBuf },
