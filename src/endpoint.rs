@@ -138,7 +138,7 @@ fn looks_like_windows_drive(spec: &str) -> bool {
 #[cfg(test)]
 // Tests create real trees on disk.
 // The label keeps leftover paths readable when a case fails.
-pub(crate) fn temp_path(label: &str) -> PathBuf {
+pub fn temp_path(label: &str) -> PathBuf {
     let unique = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map(|duration| duration.as_nanos())

@@ -1,9 +1,7 @@
 pub mod chunker;
-pub mod cli;
+pub mod endpoint;
 pub mod error;
-pub mod internal;
 pub mod manifest;
-pub mod path;
 pub mod plan;
 pub mod protocol;
 pub mod session;

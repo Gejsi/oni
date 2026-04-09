@@ -5,8 +5,8 @@
 
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, Stdio};
 
+use crate::endpoint::RemoteEndpoint;
 use crate::error::TransportError;
-use crate::path::RemoteEndpoint;
 
 /// A plain command description keeps SSH launch logic testable without
 /// inspecting `std::process::Command` internals.
@@ -27,18 +27,27 @@ impl Invocation {
                 "--".to_string(),
                 "oni".to_string(),
                 "internal".to_string(),
-                "serve-stdio".to_string(),
+                "serve".to_string(),
+                "--stdio".to_string(),
             ],
         }
     }
 
-    fn into_command(self) -> Command {
-        let mut command = Command::new(self.program);
-        command.args(self.args);
+    fn command(&self) -> Command {
+        let mut command = Command::new(&self.program);
+        command.args(&self.args);
         command.stdin(Stdio::piped());
         command.stdout(Stdio::piped());
         command.stderr(Stdio::piped());
         command
+    }
+
+    fn render(&self) -> String {
+        if self.args.is_empty() {
+            self.program.to_owned()
+        } else {
+            format!("{} {}", self.program, self.args.join(" "))
+        }
     }
 }
 
@@ -55,32 +64,25 @@ pub fn launch_helper(endpoint: &RemoteEndpoint) -> Result<LaunchedHelper, Transp
 }
 
 fn launch_invocation(invocation: Invocation) -> Result<LaunchedHelper, TransportError> {
-    // Build one human-readable target string so launch and missing-pipe errors
-    // point at the exact helper command the session tried to start.
-    let target = if invocation.args.is_empty() {
-        invocation.program.clone()
-    } else {
-        format!("{} {}", invocation.program, invocation.args.join(" "))
-    };
     let mut child = invocation
-        .into_command()
+        .command()
         .spawn()
         .map_err(|source| TransportError::Launch {
-            target: target.clone(),
+            target: invocation.render(),
             source,
         })?;
 
     let stdin = child.stdin.take().ok_or(TransportError::MissingPipe {
         pipe: "stdin",
-        target: target.clone(),
+        target: invocation.render(),
     })?;
     let stdout = child.stdout.take().ok_or(TransportError::MissingPipe {
         pipe: "stdout",
-        target: target.clone(),
+        target: invocation.render(),
     })?;
     let stderr = child.stderr.take().ok_or(TransportError::MissingPipe {
         pipe: "stderr",
-        target,
+        target: invocation.render(),
     })?;
 
     Ok(LaunchedHelper {
@@ -94,15 +96,15 @@ fn launch_invocation(invocation: Invocation) -> Result<LaunchedHelper, Transport
 fn ssh_destination(endpoint: &RemoteEndpoint) -> String {
     match &endpoint.user {
         Some(user) => format!("{user}@{}", endpoint.host),
-        None => endpoint.host.clone(),
+        None => endpoint.host.to_owned(),
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{launch_invocation, Invocation};
+    use crate::endpoint::{parse_endpoint, Endpoint};
     use crate::error::TransportError;
-    use crate::path::{parse_endpoint, Endpoint};
 
     #[test]
     fn builds_helper_invocation_with_an_explicit_user() {
@@ -116,7 +118,7 @@ mod tests {
         assert_eq!(invocation.program, "ssh");
         assert_eq!(
             invocation.args,
-            vec!["alice@example.com", "--", "oni", "internal", "serve-stdio",]
+            vec!["alice@example.com", "--", "oni", "internal", "serve", "--stdio",]
         );
     }
 
@@ -131,7 +133,7 @@ mod tests {
 
         assert_eq!(
             invocation.args,
-            vec!["buildbox", "--", "oni", "internal", "serve-stdio",]
+            vec!["buildbox", "--", "oni", "internal", "serve", "--stdio",]
         );
     }
 

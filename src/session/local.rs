@@ -15,9 +15,10 @@ use std::fs::File;
 use std::io::Read;
 use std::path::{Path, PathBuf};
 
+use crate::chunker::fastcdc::FastCdcConfig;
+use crate::endpoint::LocalEndpoint;
 use crate::error::SessionError;
 use crate::manifest::{Manifest, ManifestRoot};
-use crate::path::LocalEndpoint;
 use crate::plan::{for_each_operation, Operation};
 use crate::staging;
 use crate::strategy::cdc;
@@ -244,12 +245,7 @@ fn apply_fastcdc_delta_update(
     source_path: &Path,
     destination_path: &Path,
 ) -> Result<(), SessionError> {
-    // Current local FastCDC flow:
-    //
-    //   destination --chunk_read--> chunk bytes --hash--> basis signatures
-    //   source      --chunk_read--> chunk bytes --match--> reference/literal sink
-    //   sink + destination basis ------------------------> temp file -> rename
-    let config = cdc::FastCdcConfig::default();
+    let config = FastCdcConfig::default();
 
     let mut basis_signature_file =
         File::open(destination_path).map_err(|source| SessionError::ApplyIo {
@@ -327,13 +323,11 @@ fn directory_operation_path<'a>(
             source_index,
             destination_index: _,
         } => Ok(source_manifest.entries[source_index].path.as_path()),
-        Operation::Delete { destination_index } => Ok(
-            destination_manifest
-                .ok_or(SessionError::MissingDestinationManifest)?
-                .entries[destination_index]
-                .path
-                .as_path(),
-        ),
+        Operation::Delete { destination_index } => Ok(destination_manifest
+            .ok_or(SessionError::MissingDestinationManifest)?
+            .entries[destination_index]
+            .path
+            .as_path()),
     }
 }
 
@@ -467,8 +461,8 @@ mod tests {
     use std::fs::File;
     use std::time::{Duration, UNIX_EPOCH};
 
+    use crate::endpoint::temp_path;
     use crate::error::SessionError;
-    use crate::path::temp_path;
     use crate::plan::PlanOptions;
     use crate::session::{Chunker, Options, Request, Strategy};
 

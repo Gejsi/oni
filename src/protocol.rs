@@ -1,8 +1,8 @@
 //! Internal stdio helper protocol.
 //!
-//! This module is deliberately small: it defines versioning, capabilities,
-//! negotiated limits, and message encoding without pulling transport or sync
-//! execution concerns into the wire schema.
+//! This module defines versioning, capabilities, negotiated limits,
+//! and message encoding without pulling transport or
+//! sync execution concerns into the wire schema.
 
 use std::collections::BTreeSet;
 use std::fmt;

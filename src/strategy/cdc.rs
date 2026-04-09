@@ -7,27 +7,17 @@
 //! - turn each source chunk into either a basis reference or a literal write
 //! - stream those decisions directly into a sink
 //!
-//! The basis side still builds one per-file signature table, but the source
-//! side no longer materializes a full recipe before apply.
-//!
-//! ASCII view:
-//!
 //!   basis file --chunk_read--> chunk bytes --hash--> signature table
 //!   source file --chunk_read--> chunk bytes --hash--> reference/literal sink
 //!   sink + basis file --------------------------------> rebuilt output
-//!
-//! The remaining bounded state is the signature table for the basis file. The
-//! old source-side `Vec<RecipeChunk>` is gone from the main path.
 
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
 
-use crate::chunker::fastcdc;
+use crate::chunker::fastcdc::{self, FastCdcConfig};
 use crate::error::StrategyError;
 
 const READ_BUFFER_SIZE: usize = 8 * 1024;
-
-pub use crate::chunker::fastcdc::Config as FastCdcConfig;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ChunkSignature {

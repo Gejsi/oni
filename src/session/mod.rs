@@ -9,8 +9,8 @@ mod local;
 use std::fmt;
 use std::path::Path;
 
+use crate::endpoint::{parse_endpoint, Endpoint};
 use crate::error::{PathError, SessionError};
-use crate::path::{parse_endpoint, Endpoint};
 use crate::plan::PlanOptions;
 
 /// A parsed sync request.

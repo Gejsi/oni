@@ -24,13 +24,13 @@ use fastcdc::v2020::{self, StreamCDC};
 use crate::error::ChunkerError;
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq)]
-pub struct Config {
+pub struct FastCdcConfig {
     min_size: u32,
     avg_size: u32,
     max_size: u32,
 }
 
-impl Config {
+impl FastCdcConfig {
     /// Validate one FastCDC size triple before the rest of the code sees it.
     pub fn new(min_size: u32, avg_size: u32, max_size: u32) -> Result<Self, ChunkerError> {
         Self::validate_bounds("min-size", min_size, v2020::MINIMUM_MIN, v2020::MINIMUM_MAX)?;
@@ -83,7 +83,7 @@ impl Config {
     }
 }
 
-impl Default for Config {
+impl Default for FastCdcConfig {
     fn default() -> Self {
         Self {
             min_size: 8 * 1024,
@@ -107,7 +107,7 @@ pub struct Chunk {
 ///
 /// Useful for mmap-backed local file fast paths because the
 /// caller already owns one contiguous readable view of the input bytes.
-pub fn chunk_slice<E, F>(data: &[u8], config: Config, mut on_chunk: F) -> Result<(), E>
+pub fn chunk_slice<E, F>(data: &[u8], config: FastCdcConfig, mut on_chunk: F) -> Result<(), E>
 where
     E: From<ChunkerError>,
     F: FnMut(Chunk, &[u8]) -> Result<(), E>,
@@ -141,7 +141,7 @@ where
 /// This is streaming at Oni's API boundary, but not yet the final internal hot
 /// path because the current upstream adapter still hands us owned chunk
 /// buffers.
-pub fn chunk_read<R, E, F>(reader: &mut R, config: Config, mut on_chunk: F) -> Result<(), E>
+pub fn chunk_read<R, E, F>(reader: &mut R, config: FastCdcConfig, mut on_chunk: F) -> Result<(), E>
 where
     R: Read,
     E: From<ChunkerError>,
@@ -176,10 +176,10 @@ where
 mod tests {
     use std::io::Cursor;
 
-    use super::{chunk_read, chunk_slice, Chunk, Config};
+    use super::{chunk_read, chunk_slice, Chunk, FastCdcConfig};
     use crate::error::ChunkerError;
 
-    fn collect_slice(data: &[u8], config: Config) -> Vec<Chunk> {
+    fn collect_slice(data: &[u8], config: FastCdcConfig) -> Vec<Chunk> {
         let mut chunks = Vec::new();
         chunk_slice(data, config, |chunk, _| {
             chunks.push(chunk);
@@ -189,7 +189,7 @@ mod tests {
         chunks
     }
 
-    fn collect_reader(data: &[u8], config: Config) -> Vec<Chunk> {
+    fn collect_reader(data: &[u8], config: FastCdcConfig) -> Vec<Chunk> {
         let mut chunks = Vec::new();
         let mut reader = Cursor::new(data);
         chunk_read(&mut reader, config, |chunk, _| {
@@ -202,7 +202,7 @@ mod tests {
 
     #[test]
     fn rejects_invalid_config_ordering() {
-        let error = Config::new(16 * 1024, 8 * 1024, 64 * 1024).unwrap_err();
+        let error = FastCdcConfig::new(16 * 1024, 8 * 1024, 64 * 1024).unwrap_err();
 
         match error {
             ChunkerError::InvalidOrdering {
@@ -221,7 +221,7 @@ mod tests {
     #[test]
     fn chunks_cover_the_input_without_gaps() {
         let data = vec![b'a'; 256 * 1024];
-        let chunks = collect_slice(&data, Config::default());
+        let chunks = collect_slice(&data, FastCdcConfig::default());
 
         assert!(!chunks.is_empty());
         assert_eq!(chunks.first().unwrap().offset, 0);
@@ -240,7 +240,7 @@ mod tests {
         let data = (0..200_000)
             .map(|index| (index % 251) as u8)
             .collect::<Vec<_>>();
-        let config = Config::default();
+        let config = FastCdcConfig::default();
 
         let from_slice = collect_slice(&data, config);
         let from_reader = collect_reader(&data, config);
@@ -253,7 +253,7 @@ mod tests {
         let data = (0..80_000)
             .map(|index| (index % 241) as u8)
             .collect::<Vec<_>>();
-        let config = Config::default();
+        let config = FastCdcConfig::default();
         let mut rebuilt = Vec::new();
 
         chunk_slice(&data, config, |chunk, bytes| {
@@ -268,7 +268,7 @@ mod tests {
 
     #[test]
     fn empty_inputs_produce_no_chunks() {
-        let chunks = collect_slice(&[], Config::default());
+        let chunks = collect_slice(&[], FastCdcConfig::default());
 
         assert!(chunks.is_empty());
     }
