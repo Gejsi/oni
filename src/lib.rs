@@ -5,6 +5,4 @@ pub mod file;
 pub mod manifest;
 pub mod plan;
 pub mod protocol;
-pub mod session;
-pub mod strategy;
 pub mod transport;
