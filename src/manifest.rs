@@ -200,7 +200,7 @@ mod tests {
     use std::os::unix::fs::symlink;
     use std::path::PathBuf;
 
-    use crate::endpoint::temp_path;
+    use crate::file::temp_path;
 
     use super::{Manifest, ManifestRoot};
 

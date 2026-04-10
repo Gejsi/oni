@@ -4,8 +4,6 @@
 //! does not need to guess whether a value is local or remote.
 
 use std::path::PathBuf;
-#[cfg(test)]
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::error::PathError;
 
@@ -133,18 +131,6 @@ fn has_trailing_separator(spec: &str) -> bool {
 fn looks_like_windows_drive(spec: &str) -> bool {
     let bytes = spec.as_bytes();
     bytes.len() >= 3 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic()
-}
-
-#[cfg(test)]
-// Tests create real trees on disk.
-// The label keeps leftover paths readable when a case fails.
-pub fn temp_path(label: &str) -> PathBuf {
-    let unique = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_nanos())
-        .unwrap_or(0);
-
-    std::env::temp_dir().join(format!("oni-{label}-{unique}"))
 }
 
 #[cfg(test)]

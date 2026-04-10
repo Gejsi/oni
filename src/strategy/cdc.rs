@@ -1,15 +1,15 @@
 //! Content-defined chunking delta primitives.
 //!
 //! This baseline keeps the CDC path transport-agnostic:
-//! - chunk an existing basis file through Oni's FastCDC boundary
-//! - hash each basis chunk strongly
+//! - chunk an existing destination file through Oni's FastCDC boundary
+//! - hash each destination chunk strongly
 //! - chunk the source file with the same FastCDC parameters
-//! - turn each source chunk into either a basis reference or a literal write
+//! - turn each source chunk into either a destination reference or a literal write
 //! - stream those decisions directly into a sink
 //!
-//!   basis file --chunk_read--> chunk bytes --hash--> signature table
+//!   destination file --chunk_read--> chunk bytes --hash--> signature table
 //!   source file --chunk_read--> chunk bytes --hash--> reference/literal sink
-//!   sink + basis file --------------------------------> rebuilt output
+//!   sink + destination file --------------------------------> rebuilt output
 
 use std::collections::HashMap;
 use std::io::{Read, Seek, SeekFrom, Write};
@@ -19,29 +19,25 @@ use crate::error::StrategyError;
 
 const READ_BUFFER_SIZE: usize = 8 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 struct ChunkSignature {
-    /// Byte offset of the matching span in the basis file.
+    /// Byte offset of the matching span in the destination file.
     offset: u64,
     /// Length of that span. FastCDC chunk lengths are variable.
     len: usize,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct SignatureTable {
-    /// Basis chunks in file order. A later reference points back into this set.
+    /// Destination chunks in file order. A later reference points back into this set.
     chunks: Vec<ChunkSignature>,
-    /// Strong-hash index used to find candidate basis chunks for one source chunk.
-    ///
-    /// The value is a `Vec` because duplicate chunk contents can appear more
-    /// than once in the basis file.
+    /// Strong-hash index used to find candidate destination chunks for one source chunk.
+    /// The value is a vector because duplicate chunk contents can appear more
+    /// than once in the destination file.
     by_hash: HashMap<[u8; 32], Vec<usize>>,
 }
 
 /// One per-file summary of what the source pass emitted.
-///
-/// These counters keep profiling and tests informative without forcing the CDC
-/// path back into a buffered vector of operations.
 #[derive(Debug, Default, Copy, Clone, PartialEq, Eq)]
 pub struct DeltaStats {
     pub reference_chunks: usize,
@@ -51,8 +47,8 @@ pub struct DeltaStats {
 
 /// Destination for source-side CDC decisions.
 ///
-/// `reference()` means "reuse this span from the basis file";
-/// `literal()` means "write these source bytes directly".
+/// reference: reuse a span from the destination file
+/// literal: write new bytes from the source
 pub trait DeltaSink {
     fn literal(&mut self, bytes: &[u8]) -> Result<(), StrategyError>;
     fn reference(&mut self, offset: u64, len: usize) -> Result<(), StrategyError>;
@@ -62,10 +58,10 @@ pub fn signatures_fastcdc(
     reader: &mut impl Read,
     config: FastCdcConfig,
 ) -> Result<SignatureTable, StrategyError> {
-    // Build one bounded per-file basis index:
-    // - `chunks` keeps the original offset/length for each basis chunk
+    // Build one bounded per-file destination index:
+    // - `chunks` keeps the original offset/length for each destination chunk
     // - `by_hash` lets the source pass jump from one strong hash to candidate
-    //   basis spans without rescanning the whole basis file
+    //   destination spans without rescanning the whole destination file
     let mut chunks = Vec::new();
     let mut by_hash = HashMap::new();
 
@@ -95,7 +91,7 @@ pub fn emit_delta_fastcdc(
     emit_delta_fastcdc_into(reader, signatures, config, &mut DiscardingSink)
 }
 
-/// Stream one source file through the FastCDC matcher and emit basis
+/// Stream one source file through the FastCDC matcher and emit destination
 /// references or literal bytes immediately.
 ///
 /// This keeps the source side single-pass and lets callers decide how to apply
@@ -127,7 +123,7 @@ pub fn emit_delta_fastcdc_into(
 }
 
 /// Apply one source file directly into `writer` by rereading referenced spans
-/// from `basis` on demand.
+/// from `destination` on demand.
 ///
 /// This is the local stepping stone toward the future helper-backed flow:
 /// signatures stay buffered, but source decisions stream straight into the temp
@@ -136,10 +132,10 @@ pub fn apply_fastcdc(
     reader: &mut impl Read,
     signatures: &SignatureTable,
     config: FastCdcConfig,
-    basis: &mut (impl Read + Seek),
+    destination: &mut (impl Read + Seek),
     writer: &mut impl Write,
 ) -> Result<DeltaStats, StrategyError> {
-    let mut sink = ApplySink::new(basis, writer);
+    let mut sink = ApplySink::new(destination, writer);
     emit_delta_fastcdc_into(reader, signatures, config, &mut sink)
 }
 
@@ -156,7 +152,7 @@ impl DeltaSink for DiscardingSink {
 }
 
 struct ApplySink<'a, R, W> {
-    basis: &'a mut R,
+    destination: &'a mut R,
     writer: &'a mut W,
     buffer: [u8; READ_BUFFER_SIZE],
 }
@@ -166,9 +162,9 @@ where
     R: Read + Seek,
     W: Write,
 {
-    fn new(basis: &'a mut R, writer: &'a mut W) -> Self {
+    fn new(destination: &'a mut R, writer: &'a mut W) -> Self {
         Self {
-            basis,
+            destination,
             writer,
             buffer: [0_u8; READ_BUFFER_SIZE],
         }
@@ -190,13 +186,13 @@ where
     }
 
     fn reference(&mut self, offset: u64, len: usize) -> Result<(), StrategyError> {
-        // References intentionally reread the basis file on demand. That keeps
+        // References intentionally reread the destination file on demand. That keeps
         // the apply path bounded and mirrors the future helper-side execution
         // shape more closely than buffering copied bytes ahead of time.
-        self.basis
+        self.destination
             .seek(SeekFrom::Start(offset))
             .map_err(|source| StrategyError::Io {
-                operation: "seek basis file for CDC reference",
+                operation: "seek destination file for CDC reference",
                 source,
             })?;
 
@@ -204,10 +200,10 @@ where
         while remaining > 0 {
             let read_len = remaining.min(self.buffer.len());
             let read = self
-                .basis
+                .destination
                 .read(&mut self.buffer[..read_len])
                 .map_err(|source| StrategyError::Io {
-                    operation: "read referenced CDC basis span",
+                    operation: "read referenced CDC destination span",
                     source,
                 })?;
 

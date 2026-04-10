@@ -18,9 +18,9 @@ use std::path::{Path, PathBuf};
 use crate::chunker::fastcdc::FastCdcConfig;
 use crate::endpoint::LocalEndpoint;
 use crate::error::SessionError;
+use crate::file;
 use crate::manifest::{Manifest, ManifestRoot};
 use crate::plan::{for_each_operation, Operation};
-use crate::staging;
 use crate::strategy::cdc;
 
 use super::Options;
@@ -126,7 +126,7 @@ fn apply_operation(
         Operation::Create { source_index } => {
             let (source_path, destination_path) =
                 create_operation_paths(source, destination, source_manifest, source_index)?;
-            staging::replace_file(&source_path, &destination_path)?;
+            file::replace_file(&source_path, &destination_path)?;
         }
         Operation::UpdateData {
             source_index,
@@ -154,7 +154,7 @@ fn apply_operation(
                 source_index,
                 destination_index,
             )?;
-            staging::sync_metadata(&source_path, &destination_path)?;
+            file::sync_metadata(&source_path, &destination_path)?;
         }
         Operation::Delete { destination_index } => {
             let destination_path = delete_operation_path(
@@ -163,9 +163,9 @@ fn apply_operation(
                 destination_manifest.ok_or(SessionError::MissingDestinationManifest)?,
                 destination_index,
             )?;
-            staging::remove_file(&destination_path)?;
+            file::remove_file(&destination_path)?;
             if source_manifest.root == ManifestRoot::Directory {
-                staging::prune_empty_parent_directories(&destination_path, &destination.path)?;
+                file::prune_empty_parent_directories(&destination_path, &destination.path)?;
             }
         }
         Operation::Skip { .. } => {}
@@ -221,7 +221,7 @@ fn apply_data_update(
 ) -> Result<(), SessionError> {
     match options.strategy {
         super::Strategy::Auto | super::Strategy::Whole => {
-            staging::replace_file(source_path, destination_path)
+            file::replace_file(source_path, destination_path)
         }
         super::Strategy::Cdc => apply_cdc_delta_update(source_path, destination_path, options),
     }
@@ -260,7 +260,7 @@ fn apply_fastcdc_delta_update(
         path: source_path.to_path_buf(),
         source,
     })?;
-    staging::replace_with_writer(source_path, destination_path, |writer| {
+    file::replace_with_writer(source_path, destination_path, |writer| {
         let mut basis_apply_file =
             File::open(destination_path).map_err(|source| SessionError::ApplyIo {
                 operation: "reopen destination basis file for FastCDC delta apply",
@@ -461,8 +461,8 @@ mod tests {
     use std::fs::File;
     use std::time::{Duration, UNIX_EPOCH};
 
-    use crate::endpoint::temp_path;
     use crate::error::SessionError;
+    use crate::file::temp_path;
     use crate::plan::PlanOptions;
     use crate::session::{Chunker, Options, Request, Strategy};
 
