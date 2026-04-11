@@ -18,13 +18,11 @@ pub enum OniError {
     #[error(transparent)]
     Plan(#[from] PlanError),
     #[error(transparent)]
-    Path(#[from] PathError),
+    Path(#[from] EndpointError),
     #[error(transparent)]
     Protocol(#[from] ProtocolError),
     #[error(transparent)]
     Transport(#[from] TransportError),
-    #[error(transparent)]
-    Strategy(#[from] StrategyError),
     #[error(transparent)]
     Chunker(#[from] ChunkerError),
     #[error(transparent)]
@@ -69,7 +67,7 @@ pub enum PlanError {
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
-pub enum PathError {
+pub enum EndpointError {
     #[error("remote path is missing a host: {spec}")]
     MissingRemoteHost { spec: String },
     #[error("remote path is missing a path after the host: {spec}")]
@@ -113,30 +111,6 @@ pub enum TransportError {
     FrameTooLarge { len: usize, max: usize },
     #[error("unexpected EOF while trying to {operation} on stdio transport")]
     UnexpectedEof { operation: &'static str },
-    #[error("failed to launch helper process: {target}")]
-    Launch {
-        target: String,
-        #[source]
-        source: io::Error,
-    },
-    #[error("helper process did not expose piped {pipe}: {target}")]
-    MissingPipe { pipe: &'static str, target: String },
-}
-
-#[derive(Debug, Error)]
-pub enum StrategyError {
-    #[error("failed to {operation} during transfer-strategy processing")]
-    Io {
-        operation: &'static str,
-        #[source]
-        source: io::Error,
-    },
-    #[error(
-        "CDC delta recipe references a missing basis span at offset {offset} with length {len}"
-    )]
-    InvalidBasisSpan { offset: u64, len: usize },
-    #[error(transparent)]
-    Chunker(#[from] ChunkerError),
 }
 
 #[derive(Debug, Error)]
@@ -164,20 +138,6 @@ pub enum ChunkerError {
 
 #[derive(Debug, Error)]
 pub enum SessionError {
-    #[error(transparent)]
-    Manifest(#[from] ManifestError),
-    #[error(transparent)]
-    Plan(#[from] PlanError),
-    #[error(transparent)]
-    Strategy(#[from] StrategyError),
-    #[error(transparent)]
-    Chunker(#[from] ChunkerError),
-    #[error("failed to access file during content verification: {path}")]
-    VerifyIo {
-        path: PathBuf,
-        #[source]
-        source: io::Error,
-    },
     #[error("failed to {operation}: {path}")]
     ApplyIo {
         operation: &'static str,
@@ -185,16 +145,4 @@ pub enum SessionError {
         #[source]
         source: io::Error,
     },
-    #[error("transfer strategy is not implemented yet: {strategy}")]
-    UnsupportedStrategy { strategy: String },
-    #[error("chunker {chunker} is not implemented for strategy {strategy}")]
-    UnsupportedChunker { strategy: String, chunker: String },
-    #[error("mode is not implemented yet: {mode}")]
-    UnsupportedMode { mode: String },
-    #[error("missing destination manifest for a matched or delete operation")]
-    MissingDestinationManifest,
-    #[error("source file does not have a file name: {path}")]
-    MissingSourceName { path: PathBuf },
-    #[error("source and destination paths are required")]
-    MissingOperands,
 }

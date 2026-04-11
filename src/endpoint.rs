@@ -5,7 +5,7 @@
 
 use std::path::PathBuf;
 
-use crate::error::PathError;
+use crate::error::EndpointError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Endpoint {
@@ -63,7 +63,7 @@ impl std::fmt::Display for RemoteEndpoint {
 }
 
 /// Parse a CLI endpoint into a typed local or remote form.
-pub fn parse_endpoint(spec: &str) -> Result<Endpoint, PathError> {
+pub fn parse_endpoint(spec: &str) -> Result<Endpoint, EndpointError> {
     if let Some(remote) = try_parse_remote(spec)? {
         return Ok(Endpoint::Remote(remote));
     }
@@ -71,7 +71,7 @@ pub fn parse_endpoint(spec: &str) -> Result<Endpoint, PathError> {
     Ok(Endpoint::Local(LocalEndpoint::new(spec)))
 }
 
-fn try_parse_remote(spec: &str) -> Result<Option<RemoteEndpoint>, PathError> {
+fn try_parse_remote(spec: &str) -> Result<Option<RemoteEndpoint>, EndpointError> {
     if looks_like_windows_drive(spec) {
         return Ok(None);
     }
@@ -91,7 +91,7 @@ fn try_parse_remote(spec: &str) -> Result<Option<RemoteEndpoint>, PathError> {
     }
 
     if path.is_empty() {
-        return Err(PathError::MissingRemotePath {
+        return Err(EndpointError::MissingRemotePath {
             spec: spec.to_string(),
         });
     }
@@ -99,7 +99,7 @@ fn try_parse_remote(spec: &str) -> Result<Option<RemoteEndpoint>, PathError> {
     let (user, host) = match authority.split_once('@') {
         Some((user, host)) => {
             if user.is_empty() {
-                return Err(PathError::MissingRemoteUser {
+                return Err(EndpointError::MissingRemoteUser {
                     spec: spec.to_string(),
                 });
             }
@@ -110,7 +110,7 @@ fn try_parse_remote(spec: &str) -> Result<Option<RemoteEndpoint>, PathError> {
     };
 
     if host.is_empty() {
-        return Err(PathError::MissingRemoteHost {
+        return Err(EndpointError::MissingRemoteHost {
             spec: spec.to_string(),
         });
     }
@@ -138,7 +138,7 @@ mod tests {
     use std::path::PathBuf;
 
     use super::{parse_endpoint, Endpoint};
-    use crate::error::PathError;
+    use crate::error::EndpointError;
 
     #[test]
     fn parses_local_paths_with_colons_after_a_separator() {
@@ -205,7 +205,7 @@ mod tests {
 
         assert_eq!(
             error,
-            PathError::MissingRemotePath {
+            EndpointError::MissingRemotePath {
                 spec: "buildbox:".to_string(),
             }
         );
@@ -217,7 +217,7 @@ mod tests {
 
         assert_eq!(
             error,
-            PathError::MissingRemoteUser {
+            EndpointError::MissingRemoteUser {
                 spec: "@host:/srv/archive".to_string(),
             }
         );
