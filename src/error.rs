@@ -9,7 +9,7 @@ use std::path::{PathBuf, StripPrefixError};
 use thiserror::Error;
 
 use crate::manifest::ManifestRoot;
-use crate::protocol::{Capability, PeerRole, ProtocolVersion, VersionRange};
+use crate::transport::protocol::{ProtocolVersion, VersionRange};
 
 #[derive(Debug, Error)]
 pub enum OniError {
@@ -87,36 +87,17 @@ pub enum ProtocolError {
     },
     #[error("invalid protocol limit {field}: {value}")]
     InvalidLimit { field: &'static str, value: u32 },
-    #[error("incompatible peer roles for one session: local={local}, remote={remote}")]
-    IncompatibleRoles { local: PeerRole, remote: PeerRole },
+    #[error("invalid protocol magic: {found:?}")]
+    InvalidMagic { found: [u8; 4] },
     #[error("no shared protocol version: local supports {local}, remote supports {remote}")]
     NoSharedVersion {
         local: VersionRange,
         remote: VersionRange,
     },
-    #[error("missing required negotiated capability: {capability}")]
-    MissingRequiredCapability { capability: Capability },
-    #[error("unknown protocol message kind: {kind}")]
-    UnknownMessageKind { kind: u16 },
-    #[error("unknown peer role id in hello: {value}")]
-    UnknownPeerRole { value: u8 },
-    #[error("unknown capability id in hello: {id}")]
-    UnknownCapabilityId { id: u16 },
     #[error("truncated protocol message {message} while reading {field}")]
     TruncatedMessage {
         message: &'static str,
         field: &'static str,
-    },
-    #[error("invalid UTF-8 in protocol message {message} field {field}")]
-    InvalidTextField {
-        message: &'static str,
-        field: &'static str,
-    },
-    #[error("protocol message {message} field {field} is too large: {len} bytes")]
-    FieldTooLarge {
-        message: &'static str,
-        field: &'static str,
-        len: usize,
     },
 }
 

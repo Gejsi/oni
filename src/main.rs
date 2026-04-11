@@ -19,15 +19,15 @@ struct Cli {
     command: Option<Command>,
 
     /// Source path. Remote endpoints use [user@]host:path.
-    #[arg(value_name = "SOURCE")]
+    #[arg(value_name = "<source>")]
     source: Option<String>,
 
     /// Destination path. Remote endpoints use [user@]host:path.
-    #[arg(value_name = "DESTINATION")]
+    #[arg(value_name = "<destination>")]
     destination: Option<String>,
 }
 
-#[derive(Debug, PartialEq, Eq, Subcommand)]
+#[derive(Debug, Subcommand)]
 enum Command {
     #[command(name = "internal", hide = true)]
     Internal {
@@ -36,7 +36,7 @@ enum Command {
     },
 }
 
-#[derive(Debug, PartialEq, Eq, Subcommand)]
+#[derive(Debug, Subcommand)]
 enum InternalCommand {
     #[command(name = "serve")]
     Serve {

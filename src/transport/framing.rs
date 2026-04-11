@@ -1,13 +1,9 @@
-//! Framed stdio transport used by local and SSH-spawned helpers.
+//! Length-prefixed framing connection used by local and SSH-spawned helpers.
 
 use std::io::{Read, Write};
 
 use crate::error::TransportError;
 
-/// Length-prefixed framing over stdin/stdout.
-///
-/// The transport layer only moves opaque payload bytes. Message encoding lives
-/// in `protocol`, so transport stays reusable for local subprocesses and SSH.
 pub struct Connection<R, W> {
     reader: R,
     writer: W,
@@ -27,7 +23,7 @@ impl<R, W> Connection<R, W> {
 impl<R: Read, W: Write> Connection<R, W> {
     pub fn send_frame(&mut self, payload: &[u8]) -> Result<(), TransportError> {
         // The frame format is:
-        // - 4-byte big-endian length prefix
+        // - 4-byte little-endian length prefix
         // - raw payload bytes
         if payload.len() > self.max_frame_bytes {
             return Err(TransportError::FrameTooLarge {
@@ -43,7 +39,7 @@ impl<R: Read, W: Write> Connection<R, W> {
             })?;
 
         self.writer
-            .write_all(&frame_len.to_be_bytes())
+            .write_all(&frame_len.to_le_bytes())
             .map_err(|source| TransportError::Io {
                 operation: "write frame length",
                 source,
@@ -69,7 +65,7 @@ impl<R: Read, W: Write> Connection<R, W> {
             return Ok(None);
         };
 
-        let frame_len = u32::from_be_bytes(length_prefix) as usize;
+        let frame_len = u32::from_le_bytes(length_prefix) as usize;
         if frame_len > self.max_frame_bytes {
             return Err(TransportError::FrameTooLarge {
                 len: frame_len,
